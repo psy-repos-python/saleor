@@ -1,3 +1,5 @@
+from unittest import mock
+
 import graphene
 import pytest
 
@@ -6,7 +8,7 @@ from .....attribute.utils import associate_attribute_values_to_instance
 from ....tests.utils import get_graphql_content
 
 ATTRIBUTE_BULK_DELETE_MUTATION = """
-    mutation attributeBulkDelete($ids: [ID]!) {
+    mutation attributeBulkDelete($ids: [ID!]!) {
         attributeBulkDelete(ids: $ids) {
             count
         }
@@ -52,6 +54,40 @@ def test_delete_attributes(
     ).exists()
 
 
+@mock.patch("saleor.plugins.webhook.plugin.get_webhooks_for_event")
+@mock.patch("saleor.plugins.webhook.plugin.trigger_webhooks_async")
+def test_delete_attributes_trigger_webhooks(
+    mocked_webhook_trigger,
+    mocked_get_webhooks_for_event,
+    any_webhook,
+    staff_api_client,
+    product_type_attribute_list,
+    permission_manage_page_types_and_attributes,
+    settings,
+):
+    # given
+    mocked_get_webhooks_for_event.return_value = [any_webhook]
+    settings.PLUGINS = ["saleor.plugins.webhook.plugin.WebhookPlugin"]
+
+    variables = {
+        "ids": [
+            graphene.Node.to_global_id("Attribute", attr.id)
+            for attr in product_type_attribute_list
+        ]
+    }
+    # when
+    response = staff_api_client.post_graphql(
+        ATTRIBUTE_BULK_DELETE_MUTATION,
+        variables,
+        permissions=[permission_manage_page_types_and_attributes],
+    )
+    content = get_graphql_content(response)
+
+    # then
+    assert content["data"]["attributeBulkDelete"]["count"] == 3
+    assert mocked_webhook_trigger.call_count == 3
+
+
 def test_delete_attributes_products_search_document_updated(
     staff_api_client,
     product_type_attribute_list,
@@ -81,12 +117,18 @@ def test_delete_attributes_products_search_document_updated(
     attr_3_name = "attr 3 value"
     attr_3_value = AttributeValue.objects.create(name=attr_3_name, attribute=attr_3)
 
-    associate_attribute_values_to_instance(product_1, attr_1, attr_1_value)
     associate_attribute_values_to_instance(
-        product_1, color_attribute, color_attribute_value
+        product_1,
+        {attr_1.id: [attr_1_value], color_attribute.id: [color_attribute_value]},
     )
-    associate_attribute_values_to_instance(product_2, attr_2, attr_2_value)
-    associate_attribute_values_to_instance(variant_1, attr_3, attr_3_value)
+    associate_attribute_values_to_instance(
+        product_2,
+        {attr_2.id: [attr_2_value]},
+    )
+    associate_attribute_values_to_instance(
+        variant_1,
+        {attr_3.id: [attr_3_value]},
+    )
 
     variables = {
         "ids": [
@@ -104,19 +146,9 @@ def test_delete_attributes_products_search_document_updated(
         id__in=[attr.id for attr in product_type_attribute_list]
     ).exists()
 
-    product_1.refresh_from_db()
-    product_2.refresh_from_db()
-    assert product_1.search_document
-    assert attr_1_name not in product_1.search_document
-    assert color_attribute_value.name.lower() in product_1.search_document
-    assert attr_3_name not in product_1.search_document
-
-    assert product_2.search_document
-    assert attr_2_name not in product_2.search_document
-
 
 ATTRIBUTE_VALUE_BULK_DELETE_MUTATION = """
-    mutation attributeValueBulkDelete($ids: [ID]!) {
+    mutation attributeValueBulkDelete($ids: [ID!]!) {
         attributeValueBulkDelete(ids: $ids) {
             count
         }
@@ -146,6 +178,43 @@ def test_delete_attribute_values(
     ).exists()
 
 
+@mock.patch("saleor.plugins.webhook.plugin.get_webhooks_for_event")
+@mock.patch("saleor.plugins.webhook.plugin.trigger_webhooks_async")
+def test_delete_attribute_values_trigger_webhook(
+    mocked_webhook_trigger,
+    mocked_get_webhooks_for_event,
+    any_webhook,
+    staff_api_client,
+    attribute_value_list,
+    permission_manage_page_types_and_attributes,
+    settings,
+):
+    # given
+    mocked_get_webhooks_for_event.return_value = [any_webhook]
+    settings.PLUGINS = ["saleor.plugins.webhook.plugin.WebhookPlugin"]
+
+    attributes = {value.attribute for value in attribute_value_list}
+    variables = {
+        "ids": [
+            graphene.Node.to_global_id("AttributeValue", val.id)
+            for val in attribute_value_list
+        ]
+    }
+
+    # when
+    response = staff_api_client.post_graphql(
+        ATTRIBUTE_VALUE_BULK_DELETE_MUTATION,
+        variables,
+        permissions=[permission_manage_page_types_and_attributes],
+    )
+    content = get_graphql_content(response)
+    expected_call_count = len(attributes) + len(attribute_value_list)
+
+    # then
+    assert content["data"]["attributeValueBulkDelete"]["count"] == 3
+    assert mocked_webhook_trigger.call_count == expected_call_count
+
+
 def test_delete_attribute_values_search_document_updated(
     staff_api_client,
     product_list,
@@ -160,11 +229,6 @@ def test_delete_attribute_values_search_document_updated(
         slug="orange", name="Orange", attribute=attribute, value="#ABCD"
     )
 
-    val_1_name = value_1.name
-    val_2_name = value_2.name
-    val_3_name = value_3.name
-    val_4_name = value_4.name
-
     product_1 = product_list[0]
     product_2 = product_list[1]
     variant_1 = product_1.variants.first()
@@ -173,9 +237,18 @@ def test_delete_attribute_values_search_document_updated(
     product_type.product_attributes.add(attribute)
     product_type.variant_attributes.add(attribute)
 
-    associate_attribute_values_to_instance(product_1, attribute, value_1, value_4)
-    associate_attribute_values_to_instance(product_2, attribute, value_2)
-    associate_attribute_values_to_instance(variant_1, attribute, value_3)
+    associate_attribute_values_to_instance(
+        product_1,
+        {attribute.id: [value_1, value_4]},
+    )
+    associate_attribute_values_to_instance(
+        product_2,
+        {attribute.id: [value_2]},
+    )
+    associate_attribute_values_to_instance(
+        variant_1,
+        {attribute.id: [value_3]},
+    )
 
     variables = {
         "ids": [
@@ -195,10 +268,5 @@ def test_delete_attribute_values_search_document_updated(
 
     product_1.refresh_from_db()
     product_2.refresh_from_db()
-    assert product_1.search_document
-    assert val_1_name not in product_1.search_document
-    assert val_4_name.lower() in product_1.search_document
-    assert val_3_name not in product_1.search_document
-
-    assert product_2.search_document
-    assert val_2_name not in product_2.search_document
+    assert product_1.search_vector
+    assert product_2.search_vector

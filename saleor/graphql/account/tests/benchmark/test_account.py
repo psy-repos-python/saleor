@@ -2,10 +2,9 @@ from unittest.mock import MagicMock
 
 import graphene
 import pytest
-from django.contrib.auth.models import Group
 from django.core.files import File
 
-from .....account.models import User
+from .....account.models import Group, User
 from ....tests.utils import get_graphql_content
 
 
@@ -42,6 +41,7 @@ def test_query_staff_user(
                 lastName
                 isStaff
                 isActive
+                isConfirmed
                 addresses {
                     id
                     isDefaultShippingAddress
@@ -280,7 +280,7 @@ def test_delete_staff_members(
 ):
     """Ensure user can delete users when all permissions will be manageable."""
     query = """
-        mutation staffBulkDelete($ids: [ID]!) {
+        mutation staffBulkDelete($ids: [ID!]!) {
             staffBulkDelete(ids: $ids) {
                 count
                 errors{
@@ -401,6 +401,7 @@ def test_users_for_federation_query_count(
         ],
     }
 
+    staff_api_client.ensure_access_token()
     with django_assert_num_queries(4):
         response = staff_api_client.post_graphql(
             query,
@@ -479,6 +480,7 @@ def test_addresses_for_federation_query_count(
         ],
     }
 
+    staff_api_client.ensure_access_token()
     with django_assert_num_queries(3):
         response = staff_api_client.post_graphql(
             query,

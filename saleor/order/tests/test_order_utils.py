@@ -1,38 +1,45 @@
-import copy
 from decimal import Decimal
-from unittest.mock import Mock
 
+import graphene
 import pytest
 from prices import Money, TaxedMoney
 
 from ...checkout.fetch import fetch_checkout_info, fetch_checkout_lines
+from ...discount import DiscountType, DiscountValueType
+from ...discount.interface import VariantPromotionRuleInfo
 from ...giftcard import GiftCardEvents
 from ...giftcard.models import GiftCardEvent
-from ...order.interface import OrderTaxedPricesData
+from ...graphql.order.utils import OrderLineData
+from ...payment import TransactionEventType
 from ...plugins.manager import get_plugins_manager
-from .. import OrderStatus
+from ...product.models import VariantChannelListingPromotionRule
+from .. import OrderGrantedRefundStatus, OrderStatus
 from ..events import OrderEvents
 from ..fetch import OrderLineInfo
 from ..models import Order, OrderEvent
 from ..utils import (
     add_gift_cards_to_order,
     add_variant_to_order,
+    calculate_order_granted_refund_status,
     change_order_line_quantity,
+    create_order_line_discounts,
+    get_order_country,
+    get_total_order_discount_excluding_shipping,
     get_valid_shipping_methods_for_order,
     match_orders_with_new_user,
-    update_taxes_for_order_line,
-    update_taxes_for_order_lines,
+    order_info_for_logs,
+    update_order_display_gross_prices,
 )
 
 
 @pytest.mark.parametrize(
-    "status, previous_quantity, new_quantity, added_count, removed_count",
-    (
+    ("status", "previous_quantity", "new_quantity", "added_count", "removed_count"),
+    [
         (OrderStatus.DRAFT, 5, 2, 0, 3),
         (OrderStatus.UNCONFIRMED, 2, 5, 3, 0),
         (OrderStatus.UNCONFIRMED, 2, 0, 0, 2),
         (OrderStatus.DRAFT, 5, 5, 0, 0),
-    ),
+    ],
 )
 def test_change_quantity_generates_proper_event(
     status,
@@ -49,6 +56,7 @@ def test_change_quantity_generates_proper_event(
 
     line = order_with_lines.lines.last()
     line.quantity = previous_quantity
+
     line_info = OrderLineInfo(
         line=line,
         quantity=line.quantity,
@@ -66,8 +74,8 @@ def test_change_quantity_generates_proper_event(
         line_info,
         previous_quantity,
         new_quantity,
-        order_with_lines.channel.slug,
-        get_plugins_manager(),
+        order_with_lines.channel,
+        get_plugins_manager(allow_replica=False),
     )
 
     if removed_count:
@@ -84,9 +92,14 @@ def test_change_quantity_generates_proper_event(
     new_event = OrderEvent.objects.last()  # type: OrderEvent
     assert new_event.type == expected_type
     assert new_event.user == staff_user
+    expected_line_pk = None if new_quantity == 0 else str(line.pk)
     assert new_event.parameters == {
         "lines": [
-            {"quantity": expected_quantity, "line_pk": line.pk, "item": str(line)}
+            {
+                "quantity": expected_quantity,
+                "line_pk": expected_line_pk,
+                "item": str(line),
+            }
         ]
     }
 
@@ -113,8 +126,8 @@ def test_change_quantity_update_line_fields(
         line_info,
         line.quantity,
         new_quantity,
-        order_with_lines.channel.slug,
-        get_plugins_manager(),
+        order_with_lines.channel,
+        get_plugins_manager(allow_replica=False),
     )
 
     # then
@@ -175,7 +188,9 @@ def test_get_valid_shipping_methods_for_order(order_line_with_one_allocation, ad
 
     # when
     valid_shipping_methods = get_valid_shipping_methods_for_order(
-        order, order.channel.shipping_method_listings.all(), get_plugins_manager()
+        order,
+        order.channel.shipping_method_listings.all(),
+        get_plugins_manager(allow_replica=False),
     )
 
     # then
@@ -197,7 +212,9 @@ def test_get_valid_shipping_methods_for_order_no_channel_shipping_zones(
 
     # when
     valid_shipping_methods = get_valid_shipping_methods_for_order(
-        order, order.channel.shipping_method_listings.all(), get_plugins_manager()
+        order,
+        order.channel.shipping_method_listings.all(),
+        get_plugins_manager(allow_replica=False),
     )
 
     # then
@@ -216,7 +233,9 @@ def test_get_valid_shipping_methods_for_order_no_shipping_address(
 
     # when
     valid_shipping_methods = get_valid_shipping_methods_for_order(
-        order, order.channel.shipping_method_listings.all(), get_plugins_manager()
+        order,
+        order.channel.shipping_method_listings.all(),
+        get_plugins_manager(allow_replica=False),
     )
 
     # then
@@ -237,115 +256,62 @@ def test_get_valid_shipping_methods_for_order_shipping_not_required(
 
     # when
     valid_shipping_methods = get_valid_shipping_methods_for_order(
-        order, order.channel.shipping_method_listings.all(), get_plugins_manager()
+        order,
+        order.channel.shipping_method_listings.all(),
+        get_plugins_manager(allow_replica=False),
     )
 
     # then
     assert valid_shipping_methods == []
 
 
-def test_update_taxes_for_order_lines(order_with_lines):
+def test_add_variant_to_order(
+    order,
+    customer_user,
+    variant,
+    catalogue_promotion_with_single_rule,
+):
     # given
-    unit_price = TaxedMoney(net=Money("10.23", "USD"), gross=Money("15.80", "USD"))
-    total_price = TaxedMoney(net=Money("30.34", "USD"), gross=Money("36.49", "USD"))
-    tax_rate = Decimal("0.23")
-    unit_price_data = OrderTaxedPricesData(
-        undiscounted_price=unit_price,
-        price_with_discounts=unit_price,
+    manager = get_plugins_manager(allow_replica=False)
+    quantity = 4
+
+    promotion = catalogue_promotion_with_single_rule
+    discount_value = promotion.rules.first().reward_value
+    channel_listing = variant.channel_listings.get(channel=order.channel)
+    channel_listing.discounted_price_amount = (
+        channel_listing.price.amount - discount_value
     )
-    total_price_data = OrderTaxedPricesData(
-        undiscounted_price=total_price,
-        price_with_discounts=total_price,
+    channel_listing.save(update_fields=["discounted_price_amount"])
+
+    base_unit_price = variant.get_price(channel_listing)
+    unit_price = TaxedMoney(net=base_unit_price, gross=base_unit_price)
+    total_price = unit_price * quantity
+
+    undiscounted_base_unit_price = variant.get_base_price(channel_listing)
+    undiscounted_unit_price = TaxedMoney(
+        net=undiscounted_base_unit_price, gross=undiscounted_base_unit_price
     )
-    manager = Mock(
-        calculate_order_line_unit=Mock(return_value=unit_price_data),
-        calculate_order_line_total=Mock(return_value=total_price_data),
-        get_order_line_tax_rate=Mock(return_value=tax_rate),
-    )
+    undiscounted_total_price = undiscounted_unit_price * quantity
 
     # when
-    update_taxes_for_order_lines(
-        order_with_lines.lines.all(), order_with_lines, manager, True
+    line_data = OrderLineData(
+        variant_id=str(variant.id), variant=variant, quantity=quantity
     )
-
-    # then
-    for line in order_with_lines.lines.all():
-        assert line.unit_price == unit_price
-        assert line.total_price == total_price
-        assert line.tax_rate == tax_rate
-        assert line.undiscounted_unit_price == unit_price
-        assert line.undiscounted_total_price == total_price
-
-
-def test_update_taxes_for_order_lines_discounted_price(order_with_lines):
-    # given
-    unit_discount_amount = Decimal("2.00")
-
-    unit_price = TaxedMoney(net=Money("10.23", "USD"), gross=Money("15.80", "USD"))
-    total_price = TaxedMoney(net=Money("30.34", "USD"), gross=Money("36.49", "USD"))
-    tax_rate = Decimal("0.23")
-    discount = TaxedMoney(
-        net=Money(unit_discount_amount, "USD"), gross=Money(unit_discount_amount, "USD")
-    )
-    unit_price_data = OrderTaxedPricesData(
-        undiscounted_price=unit_price + discount,
-        price_with_discounts=unit_price,
-    )
-    total_price_data = OrderTaxedPricesData(
-        undiscounted_price=total_price + discount,
-        price_with_discounts=total_price,
-    )
-    manager = Mock(
-        calculate_order_line_unit=Mock(return_value=unit_price_data),
-        calculate_order_line_total=Mock(return_value=total_price_data),
-        get_order_line_tax_rate=Mock(return_value=tax_rate),
-    )
-
-    # when
-    update_taxes_for_order_lines(
-        order_with_lines.lines.all(), order_with_lines, manager, True
-    )
-
-    # then
-    for line in order_with_lines.lines.all():
-        assert line.unit_price == unit_price
-        assert line.total_price == total_price
-        assert line.tax_rate == tax_rate
-        assert line.undiscounted_unit_price == unit_price + discount
-        assert line.undiscounted_total_price == total_price + discount
-
-
-def test_add_variant_to_order(order, customer_user, variant, site_settings):
-    # given
-    unit_price = TaxedMoney(net=Money("10.23", "USD"), gross=Money("15.80", "USD"))
-    total_price = TaxedMoney(net=Money("30.34", "USD"), gross=Money("36.49", "USD"))
-    tax_rate = Decimal("0.23")
-    unit_price_data = OrderTaxedPricesData(
-        undiscounted_price=unit_price,
-        price_with_discounts=unit_price,
-    )
-    total_price_data = OrderTaxedPricesData(
-        undiscounted_price=total_price,
-        price_with_discounts=total_price,
-    )
-    manager = Mock(
-        calculate_order_line_unit=Mock(return_value=unit_price_data),
-        calculate_order_line_total=Mock(return_value=total_price_data),
-        get_order_line_tax_rate=Mock(return_value=tax_rate),
-    )
-    app = None
-
-    # when
     line = add_variant_to_order(
-        order, variant, 4, customer_user, app, manager, site_settings
+        order,
+        line_data,
+        customer_user,
+        None,
+        manager,
     )
 
     # then
     assert line.unit_price == unit_price
     assert line.total_price == total_price
-    assert line.undiscounted_unit_price == unit_price
-    assert line.undiscounted_total_price == total_price
-    assert line.tax_rate == tax_rate
+    assert line.undiscounted_unit_price == undiscounted_unit_price
+    assert line.undiscounted_total_price == undiscounted_total_price
+    assert line.unit_price != line.undiscounted_unit_price
+    assert line.undiscounted_unit_price != line.undiscounted_total_price
 
 
 def test_add_gift_cards_to_order(
@@ -355,13 +321,13 @@ def test_add_gift_cards_to_order(
     checkout = checkout_with_item
     checkout.user = staff_user
     checkout.gift_cards.add(gift_card, gift_card_expiry_date)
-    manager = get_plugins_manager()
+    manager = get_plugins_manager(allow_replica=False)
     lines, _ = fetch_checkout_lines(checkout)
-    checkout_info = fetch_checkout_info(checkout, lines, [], manager)
+    checkout_info = fetch_checkout_info(checkout, lines, manager)
 
     # when
     add_gift_cards_to_order(
-        checkout_info, order, Money(20, gift_card.currency), staff_user, None
+        checkout_info, order, Money(30, gift_card.currency), staff_user, None
     )
 
     # then
@@ -378,13 +344,13 @@ def test_add_gift_cards_to_order(
     assert gift_card_event.type == GiftCardEvents.USED_IN_ORDER
     assert gift_card_event.user == staff_user
     assert gift_card_event.app is None
+    assert gift_card_event.order == order
     assert gift_card_event.parameters == {
         "balance": {
             "currency": "USD",
             "current_balance": "0",
             "old_current_balance": "10.000",
         },
-        "order_id": order.id,
     }
 
     order_created_event = GiftCardEvent.objects.get(
@@ -392,14 +358,41 @@ def test_add_gift_cards_to_order(
     )
     assert order_created_event.user == staff_user
     assert order_created_event.app is None
+    assert order_created_event.order == order
     assert order_created_event.parameters == {
         "balance": {
             "currency": "USD",
             "current_balance": "0",
             "old_current_balance": "20.000",
         },
-        "order_id": order.id,
     }
+
+
+def test_add_gift_cards_to_order_with_more_than_total(
+    checkout_with_item, gift_card, gift_card_expiry_date, order, staff_user
+):
+    # given
+    checkout = checkout_with_item
+    checkout.user = staff_user
+    checkout.gift_cards.add(gift_card_expiry_date, gift_card)
+    manager = get_plugins_manager(allow_replica=False)
+    lines, _ = fetch_checkout_lines(checkout)
+    checkout_info = fetch_checkout_info(checkout, lines, manager)
+
+    # when
+    add_gift_cards_to_order(
+        checkout_info, order, Money(25, gift_card.currency), staff_user, None
+    )
+
+    # then
+    gift_card.refresh_from_db()
+    gift_card_expiry_date.refresh_from_db()
+    assert gift_card.current_balance_amount == Decimal(5)
+    assert gift_card_expiry_date.current_balance_amount == 0
+    assert gift_card.used_by == staff_user
+    assert gift_card.used_by_email == staff_user.email
+    assert gift_card_expiry_date.used_by == staff_user
+    assert gift_card_expiry_date.used_by_email == staff_user.email
 
 
 def test_add_gift_cards_to_order_no_checkout_user(
@@ -412,13 +405,13 @@ def test_add_gift_cards_to_order_no_checkout_user(
     checkout.save(update_fields=["user", "email"])
 
     checkout.gift_cards.add(gift_card, gift_card_expiry_date)
-    manager = get_plugins_manager()
+    manager = get_plugins_manager(allow_replica=False)
     lines, _ = fetch_checkout_lines(checkout)
-    checkout_info = fetch_checkout_info(checkout, lines, [], manager)
+    checkout_info = fetch_checkout_info(checkout, lines, manager)
 
     # when
     add_gift_cards_to_order(
-        checkout_info, order, Money(20, gift_card.currency), staff_user, None
+        checkout_info, order, Money(30, gift_card.currency), staff_user, None
     )
 
     # then
@@ -435,13 +428,13 @@ def test_add_gift_cards_to_order_no_checkout_user(
     assert gift_card_event.type == GiftCardEvents.USED_IN_ORDER
     assert gift_card_event.user == staff_user
     assert gift_card_event.app is None
+    assert gift_card_event.order == order
     assert gift_card_event.parameters == {
         "balance": {
             "currency": "USD",
             "current_balance": "0",
             "old_current_balance": "10.000",
         },
-        "order_id": order.id,
     }
 
     order_created_event = GiftCardEvent.objects.get(
@@ -449,49 +442,305 @@ def test_add_gift_cards_to_order_no_checkout_user(
     )
     assert order_created_event.user == staff_user
     assert order_created_event.app is None
+    assert order_created_event.order == order
     assert order_created_event.parameters == {
         "balance": {
             "currency": "USD",
             "current_balance": "0",
             "old_current_balance": "20.000",
         },
-        "order_id": order.id,
     }
 
 
-def test_update_taxes_for_order_line_deleted_variant(order_with_lines):
+def test_get_total_order_discount_excluding_shipping(order, voucher_shipping_type):
     # given
-    order_line = order_with_lines.lines.first()
-    order_line_unchanged_copy = copy.deepcopy(order_line)
-    unit_discount_amount = Decimal("2.00")
+    order.discounts.create(
+        type=DiscountType.VOUCHER,
+        value_type=DiscountValueType.FIXED,
+        value=Decimal("10.0"),
+        name=voucher_shipping_type.code,
+        currency="USD",
+        amount_value=Decimal("10.0"),
+    )
+    manual_discount = order.discounts.create(
+        type=DiscountType.MANUAL,
+        value_type=DiscountValueType.FIXED,
+        value=Decimal("10.0"),
+        name=voucher_shipping_type.code,
+        currency="USD",
+        amount_value=Decimal("10.0"),
+    )
+    currency = order.currency
+    total = TaxedMoney(Money(10, currency), Money(10, currency))
+    order.voucher = voucher_shipping_type
+    order.total = total
+    order.undiscounted_total = total
+    order.save()
 
-    unit_price = TaxedMoney(net=Money("10.23", "USD"), gross=Money("15.80", "USD"))
-    total_price = TaxedMoney(net=Money("30.34", "USD"), gross=Money("36.49", "USD"))
-    tax_rate = Decimal("0.23")
-    discount = TaxedMoney(
-        net=Money(unit_discount_amount, "USD"), gross=Money(unit_discount_amount, "USD")
+    # when
+    discount_amount = get_total_order_discount_excluding_shipping(order)
+
+    # then
+    assert discount_amount == Money(manual_discount.amount_value, order.currency)
+
+
+def test_get_total_order_discount_excluding_shipping_no_shipping_discounts(
+    order, voucher
+):
+    # given
+    discount_1 = order.discounts.create(
+        type=DiscountType.VOUCHER,
+        value_type=DiscountValueType.FIXED,
+        value=Decimal("10.0"),
+        name=voucher.code,
+        currency="USD",
+        amount_value=Decimal("10.0"),
     )
-    unit_price_data = OrderTaxedPricesData(
-        undiscounted_price=unit_price + discount,
-        price_with_discounts=unit_price,
+    discount_2 = order.discounts.create(
+        type=DiscountType.MANUAL,
+        value_type=DiscountValueType.FIXED,
+        value=Decimal("10.0"),
+        name=voucher.code,
+        currency="USD",
+        amount_value=Decimal("10.0"),
     )
-    total_price_data = OrderTaxedPricesData(
-        undiscounted_price=total_price + discount,
-        price_with_discounts=total_price,
+    currency = order.currency
+    total = TaxedMoney(Money(30, currency), Money(30, currency))
+    order.voucher = voucher
+    order.total = total
+    order.undiscounted_total = total
+    order.save()
+
+    # when
+    discount_amount = get_total_order_discount_excluding_shipping(order)
+
+    # then
+    assert discount_amount == Money(
+        discount_1.amount_value + discount_2.amount_value, order.currency
     )
-    manager = Mock(
-        calculate_order_line_unit=Mock(return_value=unit_price_data),
-        calculate_order_line_total=Mock(return_value=total_price_data),
-        get_order_line_tax_rate=Mock(return_value=tax_rate),
+
+
+def test_update_order_display_gross_prices_use_default_tax_settings(order):
+    # given
+    tax_config = order.channel.tax_configuration
+    tax_config.display_gross_prices = True
+    tax_config.save()
+    tax_config.country_exceptions.all().delete()
+
+    order.display_gross_prices = False
+    order.save(update_fields=["display_gross_prices"])
+
+    # when
+    update_order_display_gross_prices(order)
+
+    # then
+    assert order.display_gross_prices
+
+
+def test_update_order_display_gross_prices_use_country_specific_tax_settings(order):
+    # given
+    country_code = "PT"
+    tax_config = order.channel.tax_configuration
+    tax_config.display_gross_prices = False
+    tax_config.save()
+    tax_config.country_exceptions.create(
+        country=country_code, display_gross_prices=True
+    )
+
+    order.display_gross_prices = False
+    order.save(update_fields=["display_gross_prices"])
+    order.shipping_address.country = country_code
+    order.shipping_address.save()
+
+    # when
+    update_order_display_gross_prices(order)
+
+    # then
+    assert order.display_gross_prices
+
+
+def test_get_total_order_discount_excluding_shipping_no_discounts(order):
+    # when
+    discount_amount = get_total_order_discount_excluding_shipping(order)
+
+    # then
+    assert discount_amount == Money("0", order.currency)
+
+
+def test_get_order_country_use_channel_country(order):
+    # given
+    order.shipping_address = order.billing_address = None
+    order.save(update_fields=["shipping_address", "billing_address"])
+
+    # when
+    country = get_order_country(order)
+
+    # then
+    assert country == order.channel.default_country
+
+
+def test_create_order_line_discounts(
+    order_line,
+    catalogue_promotion,
+    promotion_translation_fr,
+    promotion_rule_translation_fr,
+):
+    # given
+    promotion = catalogue_promotion
+    rules = promotion.rules.all()
+    rule_1 = rules[0]
+    rule_2 = rules[1]
+
+    order = order_line.order
+    variant = order_line.variant
+    variant_channel_listing = variant.channel_listings.get(
+        channel_id=order_line.order.channel_id
+    )
+
+    (
+        listing_promotion_rule_1,
+        listing_promotion_rule_2,
+    ) = VariantChannelListingPromotionRule.objects.bulk_create(
+        [
+            VariantChannelListingPromotionRule(
+                variant_channel_listing=variant_channel_listing,
+                promotion_rule=rule_1,
+                discount_amount=Decimal("10.0"),
+                currency=order.currency,
+            ),
+            VariantChannelListingPromotionRule(
+                variant_channel_listing=variant_channel_listing,
+                promotion_rule=rule_2,
+                discount_amount=Decimal("5.0"),
+                currency=order.currency,
+            ),
+        ]
+    )
+
+    promotion_rule_translation_fr.promotion_rule = rule_1
+    promotion_rule_translation_fr.save(update_fields=["promotion_rule"])
+
+    rules_info = [
+        VariantPromotionRuleInfo(
+            rule=rule_1,
+            variant_listing_promotion_rule=listing_promotion_rule_1,
+            promotion=promotion,
+            promotion_translation=promotion_translation_fr,
+            rule_translation=promotion_rule_translation_fr,
+        ),
+        VariantPromotionRuleInfo(
+            rule=rule_2,
+            variant_listing_promotion_rule=listing_promotion_rule_2,
+            promotion=promotion,
+            promotion_translation=promotion_translation_fr,
+            rule_translation=None,
+        ),
+    ]
+
+    # when
+    line_discounts = create_order_line_discounts(order_line, rules_info)
+
+    # then
+    assert len(line_discounts) == 2
+    discount_1, discount_2 = line_discounts
+
+    for discount in [discount_1, discount_2]:
+        assert discount.line == order_line
+        assert discount.type == DiscountType.PROMOTION
+        assert discount.currency == order.currency
+        assert discount.reason is None
+
+    assert discount_1.amount_value == listing_promotion_rule_1.discount_amount
+    assert discount_1.value_type == rule_1.reward_value_type
+    assert discount_1.value == rule_1.reward_value
+    assert discount_1.name == f"{promotion.name}: {rule_1.name}"
+    assert (
+        discount_1.translated_name
+        == f"{promotion_translation_fr.name}: {promotion_rule_translation_fr.name}"
+    )
+    assert discount_1.promotion_rule == rule_1
+
+    assert discount_2.amount_value == listing_promotion_rule_2.discount_amount
+    assert discount_2.value_type == rule_2.reward_value_type
+    assert discount_2.value == rule_2.reward_value
+    assert discount_2.name == f"{promotion.name}: {rule_2.name}"
+    assert discount_2.translated_name == f"{promotion_translation_fr.name}"
+    assert discount_2.promotion_rule == rule_2
+
+
+@pytest.mark.parametrize(
+    ("expected_granted_status", "event_type"),
+    [
+        (OrderGrantedRefundStatus.NONE, TransactionEventType.CHARGE_SUCCESS),
+        (OrderGrantedRefundStatus.PENDING, TransactionEventType.REFUND_REQUEST),
+        (OrderGrantedRefundStatus.SUCCESS, TransactionEventType.REFUND_SUCCESS),
+        (OrderGrantedRefundStatus.FAILURE, TransactionEventType.REFUND_FAILURE),
+        (OrderGrantedRefundStatus.NONE, TransactionEventType.REFUND_REVERSE),
+    ],
+)
+def test_calculate_order_granted_refund_status(
+    expected_granted_status, event_type, order, transaction_item_generator
+):
+    # given
+    transaction_item = transaction_item_generator(
+        order_id=order.pk,
+        charged_value=Decimal("100.00"),
+        refunded_value=Decimal("5.00"),
+    )
+
+    granted_refund = order.granted_refunds.create(
+        amount_value=Decimal("10.00"),
+        currency=order.currency,
+        transaction_item=transaction_item,
+    )
+
+    transaction_item.events.create(
+        amount_value=Decimal("10.00"),
+        currency=order.currency,
+        type=event_type,
+        related_granted_refund=granted_refund,
     )
 
     # when
-    order_line.variant = None
-    update_taxes_for_order_line(order_line, order_with_lines, manager, True)
+    calculate_order_granted_refund_status(granted_refund)
 
     # then
-    assert order_line.unit_price == order_line_unchanged_copy.unit_price
-    assert order_line.total_price == order_line_unchanged_copy.total_price
-    assert order_line.tax_rate == order_line_unchanged_copy.tax_rate
-    assert order_line.undiscounted_unit_price == order_line_unchanged_copy.unit_price
-    assert order_line.undiscounted_total_price == order_line_unchanged_copy.total_price
+    granted_refund.refresh_from_db()
+    assert granted_refund.status == expected_granted_status
+
+
+def test_order_info_for_logs(order_with_lines, voucher, order_promotion_with_rule):
+    # given
+    order = order_with_lines
+    voucher_code = voucher.codes.first().code
+    order.voucher_code = voucher_code
+    order.voucher = voucher
+    order.status = OrderStatus.DRAFT
+    order.save(update_fields=["voucher_code", "voucher_id", "status"])
+
+    order.discounts.create(
+        type=DiscountType.ORDER_PROMOTION,
+        value_type=DiscountValueType.FIXED,
+        value=Decimal(5),
+        amount_value=Decimal(5),
+        promotion_rule=order_promotion_with_rule.rules.first(),
+        currency=order.currency,
+    )
+
+    lines = order.lines.all()
+    lines[0].discounts.create(
+        type=DiscountType.VOUCHER,
+        value_type=DiscountValueType.FIXED,
+        value=Decimal(5),
+        currency=order.currency,
+        amount_value=Decimal(5),
+        voucher=voucher,
+    )
+
+    # when
+    extra = order_info_for_logs(order, lines)
+
+    # then
+    assert extra["order_id"] == graphene.Node.to_global_id("Order", order.pk)
+    assert extra["discounts"]
+    assert extra["lines"][0]["discounts"]

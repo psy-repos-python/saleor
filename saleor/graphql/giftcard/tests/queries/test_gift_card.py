@@ -87,7 +87,7 @@ def test_query_gift_card_with_permissions(
     assert data["isActive"] == gift_card.is_active
     assert data["expiryDate"] is None
     assert data["tags"][0]["name"] == gift_card.tags.first().name
-    assert data["created"] == gift_card.created.isoformat()
+    assert data["created"] == gift_card.created_at.isoformat()
     assert data["lastUsedOn"] == gift_card.last_used_on
     assert data["boughtInChannel"] is None
     assert data["initialBalance"]["currency"] == gift_card.initial_balance.currency
@@ -152,7 +152,7 @@ def test_query_gift_card_by_app(
     assert data["isActive"] == gift_card.is_active
     assert data["expiryDate"] is None
     assert data["tags"][0]["name"] == gift_card.tags.first().name
-    assert data["created"] == gift_card.created.isoformat()
+    assert data["created"] == gift_card.created_at.isoformat()
     assert data["lastUsedOn"] == gift_card.last_used_on
     assert data["initialBalance"]["currency"] == gift_card.initial_balance.currency
     assert data["initialBalance"]["amount"] == gift_card.initial_balance.amount
@@ -164,6 +164,38 @@ def test_query_gift_card_by_app(
     assert data["usedByEmail"] == gift_card.used_by_email
     assert data["product"]["name"] == non_shippable_gift_card_product.name
     assert data["app"]["name"] == app.name
+
+
+def test_query_gift_card_by_removed_app(
+    staff_api_client,
+    gift_card,
+    removed_app,
+    permission_manage_gift_card,
+    permission_manage_users,
+    permission_manage_apps,
+):
+    # given
+    gift_card.app = removed_app
+    gift_card.save(update_fields=["app"])
+    query = QUERY_GIFT_CARD_BY_ID
+    gift_card_id = graphene.Node.to_global_id("GiftCard", gift_card.pk)
+    variables = {"id": gift_card_id}
+
+    # when
+    response = staff_api_client.post_graphql(
+        query,
+        variables,
+        permissions=[
+            permission_manage_gift_card,
+            permission_manage_users,
+            permission_manage_apps,
+        ],
+    )
+
+    # then
+    content = get_graphql_content(response)
+    data = content["data"]["giftCard"]
+    assert data["app"] is None
 
 
 def test_query_gift_card_by_app_no_premissions(
@@ -224,33 +256,6 @@ def test_query_gift_card_by_customer(
     # when
     # Query should fail without manage_users permission.
     response = api_client.post_graphql(query, variables)
-
-    # then
-    assert_no_permission(response)
-
-
-def test_query_used_gift_card_no_permission(
-    staff_api_client,
-    gift_card_used,
-    permission_manage_gift_card,
-    permission_manage_users,
-    permission_manage_apps,
-):
-    # given
-    query = QUERY_GIFT_CARD_BY_ID
-    gift_card_id = graphene.Node.to_global_id("GiftCard", gift_card_used.pk)
-    variables = {"id": gift_card_id}
-
-    # when
-    response = staff_api_client.post_graphql(
-        query,
-        variables,
-        permissions=[
-            permission_manage_gift_card,
-            permission_manage_users,
-            permission_manage_apps,
-        ],
-    )
 
     # then
     assert_no_permission(response)
@@ -344,7 +349,7 @@ def test_staff_query_gift_card_by_invalid_id(
     # then
     content = get_graphql_content_from_response(response)
     assert len(content["errors"]) == 1
-    assert content["errors"][0]["message"] == f"Couldn't resolve id: {id}."
+    assert content["errors"][0]["message"] == f"Invalid ID: {id}. Expected: GiftCard."
     assert content["data"]["giftCard"] is None
 
 
@@ -474,7 +479,7 @@ def test_query_gift_card_events(
     assert events_data[1]["message"] == parameters["message"]
     assert events_data[1]["email"] == parameters["email"]
     assert events_data[1]["orderId"] == graphene.Node.to_global_id("Order", order.pk)
-    assert events_data[1]["orderNumber"] == str(order.pk)
+    assert events_data[1]["orderNumber"] == str(order.number)
     assert events_data[1]["tags"] == parameters["tags"]
     assert events_data[1]["oldTags"] == parameters["old_tags"]
     assert (
@@ -511,6 +516,44 @@ def test_query_gift_card_events(
     )
     assert events_data[1]["expiryDate"] == parameters["expiry_date"].isoformat()
     assert events_data[1]["oldExpiryDate"] == parameters["old_expiry_date"].isoformat()
+
+
+def test_query_gift_card_event_with_removed_app(
+    staff_api_client,
+    removed_app,
+    gift_card,
+    permission_manage_gift_card,
+    permission_manage_apps,
+    permission_manage_users,
+):
+    # given
+    assert staff_api_client.user
+
+    GiftCardEvent.objects.create(
+        app=removed_app,
+        gift_card=gift_card,
+        type=GiftCardEvents.ISSUED,
+        date=timezone.now(),
+    )
+
+    variables = {"id": graphene.Node.to_global_id("GiftCard", gift_card.pk)}
+
+    # when
+    response = staff_api_client.post_graphql(
+        QUERY_GIFT_CARD_EVENTS,
+        variables,
+        permissions=[
+            permission_manage_gift_card,
+            permission_manage_apps,
+            permission_manage_users,
+        ],
+    )
+
+    # then
+    content = get_graphql_content(response)
+    events_data = content["data"]["giftCard"]["events"]
+    assert len(events_data) == 1
+    assert events_data[0]["app"] is None
 
 
 def test_query_gift_card_expiry_date_set_event(
@@ -553,6 +596,7 @@ def test_query_gift_card_used_in_order_event(
     staff_api_client,
     gift_card,
     app,
+    order,
     permission_manage_gift_card,
     permission_manage_apps,
     permission_manage_users,
@@ -560,8 +604,7 @@ def test_query_gift_card_used_in_order_event(
     # given
     previous_balance = 10.0
     balance_data = [(gift_card, previous_balance)]
-    order_id = 1
-    events.gift_cards_used_in_order_event(balance_data, order_id, None, app)
+    events.gift_cards_used_in_order_event(balance_data, order, None, app)
     variables = {"id": graphene.Node.to_global_id("GiftCard", gift_card.pk)}
 
     # when
@@ -603,7 +646,7 @@ def test_query_gift_card_bought_event(
     permission_manage_users,
 ):
     # given
-    events.gift_cards_bought_event([gift_card_expiry_date], order.id, None, app)
+    events.gift_cards_bought_event([gift_card_expiry_date], order, None, app)
     variables = {"id": graphene.Node.to_global_id("GiftCard", gift_card_expiry_date.pk)}
 
     # when
@@ -633,7 +676,7 @@ def test_query_gift_card_bought_event(
 
 
 @pytest.mark.parametrize(
-    "gift_card_type, count",
+    ("gift_card_type", "count"),
     [
         (GiftCardEventsEnum.BOUGHT.name, 1),
         (GiftCardEventsEnum.USED_IN_ORDER.name, 2),
@@ -655,11 +698,9 @@ def test_query_gift_card_events_filter_by_type(
     # given
     previous_balance = 10.0
     balance_data = [(gift_card, previous_balance)]
-    events.gift_cards_bought_event(
-        [gift_card, gift_card_expiry_date], order.id, None, app
-    )
-    events.gift_cards_used_in_order_event(balance_data, 1, None, app)
-    events.gift_cards_used_in_order_event(balance_data, 2, None, app)
+    events.gift_cards_bought_event([gift_card, gift_card_expiry_date], order, None, app)
+    events.gift_cards_used_in_order_event(balance_data, order, None, app)
+    events.gift_cards_used_in_order_event(balance_data, order, None, app)
 
     assert gift_card.events.count() == 3
     assert GiftCardEvent.objects.count() == 4
@@ -699,25 +740,22 @@ def test_query_gift_card_events_filter_by_orders(
     permission_manage_gift_card,
     permission_manage_apps,
     permission_manage_users,
+    order_list,
 ):
     # given
     previous_balance = 10.0
-    order_pk_1 = 1
     events.gift_cards_bought_event(
-        [gift_card, gift_card_expiry_date], order_pk_1, None, app
+        [gift_card, gift_card_expiry_date], order_list[0], None, app
     )
     balance_data = [(gift_card, previous_balance)]
-    order_pk_2 = 2
-    events.gift_cards_used_in_order_event(balance_data, order_pk_2, None, app)
-    order_pk_3 = 3
-    events.gift_cards_used_in_order_event(balance_data, order_pk_3, None, app)
+    events.gift_cards_used_in_order_event(balance_data, order_list[1], None, app)
+    events.gift_cards_used_in_order_event(balance_data, order_list[2], None, app)
 
     assert gift_card.events.count() == 3
     assert GiftCardEvent.objects.count() == 4
 
     order_ids = [
-        graphene.Node.to_global_id("Order", order_pk)
-        for order_pk in [order_pk_1, order_pk_2]
+        graphene.Node.to_global_id("Order", order.pk) for order in order_list[:2]
     ]
     variables = {
         "id": graphene.Node.to_global_id("GiftCard", gift_card.pk),
@@ -762,11 +800,8 @@ def test_query_gift_card_events_filter_by_orders_no_events(
     # given
     previous_balance = 10.0
     balance_data = [(gift_card, previous_balance)]
-    order_pk = 1
-    events.gift_cards_bought_event(
-        [gift_card, gift_card_expiry_date], order.id, None, app
-    )
-    events.gift_cards_used_in_order_event(balance_data, order_pk, None, app)
+    events.gift_cards_bought_event([gift_card, gift_card_expiry_date], order, None, app)
+    events.gift_cards_used_in_order_event(balance_data, order, None, app)
 
     assert gift_card.events.count() == 2
     assert GiftCardEvent.objects.count() == 3

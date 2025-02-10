@@ -1,10 +1,9 @@
-from datetime import date
-from typing import Any, Dict, Optional, Tuple
+import datetime
+from typing import Any
 
 import micawber
 from django.core.exceptions import ValidationError
 
-from ...account.models import User
 from ...product import ProductMediaTypes
 from ...product.error_codes import ProductErrorCode
 
@@ -16,7 +15,7 @@ MEDIA_MAX_WIDTH = 1920
 MEDIA_MAX_HEIGHT = 1080
 
 
-def get_oembed_data(url: str, field_name: str) -> Tuple[Dict[str, Any], str]:
+def get_oembed_data(url: str, field_name: str) -> tuple[dict[str, Any], str]:
     """Get the oembed data from URL or raise an ValidationError."""
     providers = micawber.bootstrap_basic()
 
@@ -25,7 +24,7 @@ def get_oembed_data(url: str, field_name: str) -> Tuple[Dict[str, Any], str]:
             url, maxwidth=MEDIA_MAX_WIDTH, maxheight=MEDIA_MAX_HEIGHT
         )
         return oembed_data, SUPPORTED_MEDIA_TYPES[oembed_data["type"]]
-    except (micawber.exceptions.ProviderException, KeyError):
+    except (micawber.exceptions.ProviderException, KeyError) as e:
         raise ValidationError(
             {
                 field_name: ValidationError(
@@ -33,14 +32,9 @@ def get_oembed_data(url: str, field_name: str) -> Tuple[Dict[str, Any], str]:
                     code=ProductErrorCode.UNSUPPORTED_MEDIA_PROVIDER.value,
                 )
             }
-        )
-
-
-def user_is_valid(user: Optional[User]) -> bool:
-    """Return True when user is provided and is not anonymous."""
-    return bool(user and not user.is_anonymous)
+        ) from e
 
 
 def is_date_in_future(given_date):
     """Return true when the date is in the future."""
-    return given_date > date.today()
+    return given_date > datetime.datetime.now(tz=datetime.UTC).date()

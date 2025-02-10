@@ -1,30 +1,29 @@
 from decimal import Decimal
-from unittest.mock import Mock, patch
+from unittest.mock import patch
 
 import graphene
 import pytest
 from prices import Money, TaxedMoney
 
+from ...core.utils.translations import get_translation
 from ...core.weight import zero_weight
-from ...discount import OrderDiscountType
+from ...discount import DiscountType, RewardValueType
+from ...discount.interface import VariantPromotionRuleInfo
 from ...discount.models import (
     DiscountValueType,
-    NotApplicable,
-    Voucher,
-    VoucherChannelListing,
-    VoucherType,
 )
-from ...discount.utils import validate_voucher_in_order
+from ...discount.utils.voucher import validate_voucher_in_order
+from ...graphql.core.utils import to_global_id_or_none
+from ...graphql.order.utils import OrderLineData
 from ...graphql.tests.utils import get_graphql_content
-from ...order.interface import OrderTaxedPricesData
 from ...payment import ChargeStatus
 from ...payment.models import Payment
 from ...plugins.manager import get_plugins_manager
-from ...product.models import Collection
 from ...warehouse import WarehouseClickAndCollectOption
 from ...warehouse.models import Stock, Warehouse
 from ...warehouse.tests.utils import get_quantity_allocated_for_stock
-from .. import FulfillmentStatus, OrderEvents, OrderStatus
+from .. import FulfillmentStatus, OrderChargeStatus, OrderEvents, OrderStatus
+from ..calculations import fetch_order_prices_if_expired
 from ..events import (
     OrderEventsEmails,
     event_fulfillment_confirmed_notification,
@@ -43,12 +42,12 @@ from ..utils import (
     add_variant_to_order,
     change_order_line_quantity,
     delete_order_line,
-    get_voucher_discount_for_order,
-    recalculate_order,
     restock_fulfillment_lines,
-    update_order_prices,
+    update_order_authorize_data,
+    update_order_charge_data,
     update_order_status,
 )
+from .fixtures import recalculate_order
 
 
 def test_total_setter():
@@ -64,34 +63,43 @@ def test_total_setter():
 
 def test_order_get_subtotal(order_with_lines):
     order_with_lines.discounts.create(
-        type=OrderDiscountType.VOUCHER,
+        type=DiscountType.VOUCHER,
         value_type=DiscountValueType.FIXED,
         value=order_with_lines.total.gross.amount * Decimal("0.5"),
         amount_value=order_with_lines.total.gross.amount * Decimal("0.5"),
         name="Test discount",
     )
 
-    recalculate_order(order_with_lines)
-
+    fetch_order_prices_if_expired(
+        order_with_lines, get_plugins_manager(allow_replica=False), force_update=True
+    )
     target_subtotal = order_with_lines.total - order_with_lines.shipping_price
-    assert order_with_lines.get_subtotal() == target_subtotal
+    assert order_with_lines.subtotal == target_subtotal
+
+
+def test_recalculate_order_keeps_weight_unit(order_with_lines):
+    initial_weight_unit = order_with_lines.weight.unit
+    recalculate_order(order_with_lines)
+    recalculated_weight_unit = order_with_lines.weight.unit
+    assert initial_weight_unit == recalculated_weight_unit
 
 
 def test_add_variant_to_order_adds_line_for_new_variant(
-    order_with_lines, product, product_translation_fr, settings, info, site_settings
+    order_with_lines,
+    product,
+    anonymous_plugins,
 ):
     order = order_with_lines
     variant = product.variants.get()
     lines_before = order.lines.count()
-    settings.LANGUAGE_CODE = "fr"
+    line_data = OrderLineData(variant_id=str(variant.id), variant=variant, quantity=1)
+
     add_variant_to_order(
-        order,
-        variant,
-        1,
-        info.context.user,
-        info.context.app,
-        info.context.plugins,
-        site_settings,
+        order=order,
+        line_data=line_data,
+        user=None,
+        app=None,
+        manager=anonymous_plugins,
     )
 
     line = order.lines.last()
@@ -100,7 +108,6 @@ def test_add_variant_to_order_adds_line_for_new_variant(
     assert line.product_variant_id == variant.get_global_id()
     assert line.quantity == 1
     assert line.unit_price == TaxedMoney(net=Money(10, "USD"), gross=Money(10, "USD"))
-    assert line.translated_product_name == str(variant.product.translated)
     assert line.variant_name == str(variant)
     assert line.product_name == str(variant.product)
     assert not line.unit_discount_amount
@@ -108,141 +115,139 @@ def test_add_variant_to_order_adds_line_for_new_variant(
     assert not line.unit_discount_reason
 
 
-def test_add_variant_to_order_adds_line_for_new_variant_on_sale(
+def test_add_variant_to_order_adds_line_for_new_variant_on_promotion(
     order_with_lines,
     product,
-    product_translation_fr,
-    sale,
-    discount_info,
-    settings,
-    info,
-    site_settings,
+    anonymous_plugins,
+    catalogue_promotion_without_rules,
 ):
+    # given
     order = order_with_lines
     variant = product.variants.first()
-    discount_info.variants_ids.add(variant.id)
-    sale.variants.add(variant)
-    lines_before = order.lines.count()
-    settings.LANGUAGE_CODE = "fr"
 
-    add_variant_to_order(
-        order,
-        variant,
-        1,
-        info.context.user,
-        info.context.app,
-        info.context.plugins,
-        site_settings,
-        [discount_info],
+    reward_value = Decimal("5")
+    rule = catalogue_promotion_without_rules.rules.create(
+        catalogue_predicate={
+            "productPredicate": {
+                "ids": [graphene.Node.to_global_id("Product", variant.product.id)]
+            }
+        },
+        reward_value_type=RewardValueType.FIXED,
+        reward_value=reward_value,
+    )
+    rule.channels.add(order.channel)
+
+    channel_listing = variant.channel_listings.get(channel=order.channel)
+    channel_listing.discounted_price_amount = (
+        channel_listing.price.amount - reward_value
+    )
+    channel_listing.save(update_fields=["discounted_price_amount"])
+
+    listing_rule = channel_listing.variantlistingpromotionrule.create(
+        promotion_rule=rule,
+        discount_amount=reward_value,
+        currency=channel_listing.channel.currency_code,
     )
 
+    lines_before = order.lines.count()
+    line_data = OrderLineData(
+        variant_id=str(variant.id),
+        variant=variant,
+        quantity=1,
+        rules_info=[
+            VariantPromotionRuleInfo(
+                rule=rule,
+                variant_listing_promotion_rule=listing_rule,
+                promotion=catalogue_promotion_without_rules,
+                promotion_translation=None,
+                rule_translation=None,
+            )
+        ],
+    )
+
+    # when
+    add_variant_to_order(
+        order=order,
+        line_data=line_data,
+        user=None,
+        app=None,
+        manager=anonymous_plugins,
+    )
+
+    # then
     line = order.lines.last()
     variant_channel_listing = variant.channel_listings.get(channel=order.channel)
-    sale_channel_listing = sale.channel_listings.first()
     assert order.lines.count() == lines_before + 1
     assert line.product_sku == variant.sku
     assert line.quantity == 1
-    unit_amount = (
-        variant_channel_listing.price_amount - sale_channel_listing.discount_value
-    )
+    unit_amount = variant_channel_listing.discounted_price_amount
     assert line.unit_price == TaxedMoney(
         net=Money(unit_amount, "USD"), gross=Money(unit_amount, "USD")
     )
-    assert line.translated_product_name == str(variant.product.translated)
     assert line.variant_name == str(variant)
     assert line.product_name == str(variant.product)
 
-    assert line.unit_discount_amount == sale_channel_listing.discount_value
-    assert line.unit_discount_value == sale_channel_listing.discount_value
-    assert line.unit_discount_reason
+    assert line.unit_discount_amount == reward_value
+    assert line.unit_discount_value == reward_value
 
-
-def test_add_variant_to_draft_order_adds_line_for_new_variant_with_tax(
-    order_with_lines, product, product_translation_fr, settings, info, site_settings
-):
-    order = order_with_lines
-    variant = product.variants.get()
-    lines_before = order.lines.count()
-    settings.LANGUAGE_CODE = "fr"
-    unit_price = TaxedMoney(net=Money(8, "USD"), gross=Money(10, "USD"))
-    total_price = TaxedMoney(net=Money("30.34", "USD"), gross=Money("36.49", "USD"))
-    unit_price_data = OrderTaxedPricesData(
-        undiscounted_price=unit_price,
-        price_with_discounts=unit_price,
-    )
-    total_price_data = OrderTaxedPricesData(
-        undiscounted_price=total_price,
-        price_with_discounts=total_price,
-    )
-    manager = Mock(
-        calculate_order_line_unit=Mock(return_value=unit_price_data),
-        calculate_order_line_total=Mock(return_value=total_price_data),
-        get_order_line_tax_rate=Mock(return_value=0.25),
-    )
-
-    add_variant_to_order(
-        order, variant, 1, info.context.user, info.context.app, manager, site_settings
-    )
-
-    line = order.lines.last()
-    assert order.lines.count() == lines_before + 1
-    assert line.product_sku == variant.sku
-    assert line.product_variant_id == variant.get_global_id()
-    assert line.quantity == 1
-    assert line.unit_price == unit_price
-    assert line.total_price == total_price
-    assert line.translated_product_name == str(variant.product.translated)
-    assert line.variant_name == str(variant)
-    assert line.product_name == str(variant.product)
+    assert line.discounts.count() == 1
+    assert line.discounts.first().promotion_rule == rule
 
 
 def test_add_variant_to_draft_order_adds_line_for_variant_with_price_0(
-    order_with_lines, product, product_translation_fr, settings, info, site_settings
+    order_with_lines,
+    product,
+    anonymous_plugins,
 ):
+    # given
     order = order_with_lines
     variant = product.variants.get()
     variant_channel_listing = variant.channel_listings.get()
     variant_channel_listing.price = Money(0, "USD")
-    variant_channel_listing.save(update_fields=["price_amount", "currency"])
-
-    lines_before = order.lines.count()
-    settings.LANGUAGE_CODE = "fr"
-    add_variant_to_order(
-        order,
-        variant,
-        1,
-        info.context.user,
-        info.context.app,
-        info.context.plugins,
-        site_settings,
+    variant_channel_listing.discounted_price = Money(0, "USD")
+    variant_channel_listing.save(
+        update_fields=["price_amount", "discounted_price_amount", "currency"]
     )
 
+    lines_before = order.lines.count()
+    line_data = OrderLineData(variant_id=str(variant.id), variant=variant, quantity=1)
+
+    # when
+    add_variant_to_order(
+        order=order,
+        line_data=line_data,
+        user=None,
+        app=None,
+        manager=anonymous_plugins,
+    )
+
+    # then
     line = order.lines.last()
     assert order.lines.count() == lines_before + 1
     assert line.product_sku == variant.sku
     assert line.product_variant_id == variant.get_global_id()
     assert line.quantity == 1
     assert line.unit_price == TaxedMoney(net=Money(0, "USD"), gross=Money(0, "USD"))
-    assert line.translated_product_name == str(variant.product.translated)
     assert line.product_name == variant.product.name
 
 
 def test_add_variant_to_order_not_allocates_stock_for_new_variant(
-    order_with_lines, product, info, site_settings
+    order_with_lines,
+    product,
+    anonymous_plugins,
 ):
     variant = product.variants.get()
     stock = Stock.objects.get(product_variant=variant)
 
     stock_before = get_quantity_allocated_for_stock(stock)
 
+    line_data = OrderLineData(variant_id=str(variant.id), variant=variant, quantity=1)
     add_variant_to_order(
-        order_with_lines,
-        variant,
-        1,
-        info.context.user,
-        info.context.app,
-        info.context.plugins,
-        site_settings,
+        order=order_with_lines,
+        line_data=line_data,
+        user=None,
+        app=None,
+        manager=anonymous_plugins,
     )
 
     stock.refresh_from_db()
@@ -250,21 +255,22 @@ def test_add_variant_to_order_not_allocates_stock_for_new_variant(
 
 
 def test_add_variant_to_order_edits_line_for_existing_variant(
-    order_with_lines, info, site_settings
+    order_with_lines, anonymous_plugins
 ):
     existing_line = order_with_lines.lines.first()
     variant = existing_line.variant
     lines_before = order_with_lines.lines.count()
     line_quantity_before = existing_line.quantity
+    line_data = OrderLineData(
+        line_id=str(existing_line.pk), variant=variant, quantity=1
+    )
 
     add_variant_to_order(
-        order_with_lines,
-        variant,
-        1,
-        info.context.user,
-        info.context.app,
-        info.context.plugins,
-        site_settings,
+        order=order_with_lines,
+        line_data=line_data,
+        user=None,
+        app=None,
+        manager=anonymous_plugins,
     )
 
     existing_line.refresh_from_db()
@@ -275,7 +281,7 @@ def test_add_variant_to_order_edits_line_for_existing_variant(
 
 
 def test_add_variant_to_order_not_allocates_stock_for_existing_variant(
-    order_with_lines, info, site_settings
+    order_with_lines, anonymous_plugins
 ):
     existing_line = order_with_lines.lines.first()
     variant = existing_line.variant
@@ -283,15 +289,16 @@ def test_add_variant_to_order_not_allocates_stock_for_existing_variant(
     stock_before = get_quantity_allocated_for_stock(stock)
     quantity_before = existing_line.quantity
     quantity_unfulfilled_before = existing_line.quantity_unfulfilled
+    line_data = OrderLineData(
+        line_id=str(existing_line.id), variant=variant, quantity=1
+    )
 
     add_variant_to_order(
-        order_with_lines,
-        variant,
-        1,
-        info.context.user,
-        info.context.app,
-        info.context.plugins,
-        site_settings,
+        order=order_with_lines,
+        line_data=line_data,
+        user=None,
+        app=None,
+        manager=anonymous_plugins,
     )
 
     stock.refresh_from_db()
@@ -459,7 +466,7 @@ def test_order_queryset_confirmed(draft_order, channel_USD):
     confirmed_orders = Order.objects.confirmed()
 
     assert draft_order not in confirmed_orders
-    assert all([order in confirmed_orders for order in other_orders])
+    assert all(order in confirmed_orders for order in other_orders)
 
 
 def test_order_queryset_drafts(draft_order, channel_USD):
@@ -475,7 +482,7 @@ def test_order_queryset_drafts(draft_order, channel_USD):
     draft_orders = Order.objects.drafts()
 
     assert draft_order in draft_orders
-    assert all([order not in draft_orders for order in other_orders])
+    assert all(order not in draft_orders for order in other_orders)
 
 
 def test_order_queryset_to_ship(settings, channel_USD):
@@ -484,13 +491,13 @@ def test_order_queryset_to_ship(settings, channel_USD):
         Order.objects.create(
             status=OrderStatus.UNFULFILLED,
             total=total,
-            total_paid_amount=total.gross.amount,
+            total_charged_amount=total.gross.amount,
             channel=channel_USD,
         ),
         Order.objects.create(
             status=OrderStatus.PARTIALLY_FULFILLED,
             total=total,
-            total_paid_amount=total.gross.amount,
+            total_charged_amount=total.gross.amount,
             channel=channel_USD,
         ),
     ]
@@ -523,8 +530,8 @@ def test_order_queryset_to_ship(settings, channel_USD):
 
     orders = Order.objects.ready_to_fulfill()
 
-    assert all([order in orders for order in orders_to_ship])
-    assert all([order not in orders for order in orders_not_to_ship])
+    assert all(order in orders for order in orders_to_ship)
+    assert all(order not in orders for order in orders_not_to_ship)
 
 
 def test_queryset_ready_to_capture(channel_USD):
@@ -550,110 +557,6 @@ def test_queryset_ready_to_capture(channel_USD):
     assert OrderStatus.CANCELED not in statuses
 
 
-@patch("saleor.plugins.manager.PluginsManager.calculate_order_line_unit")
-def test_update_order_prices(
-    mocked_calculate_order_line_unit, order_with_lines, site_settings
-):
-    manager = get_plugins_manager()
-    channel = order_with_lines.channel
-    address = order_with_lines.shipping_address
-    address.country = "DE"
-    address.save()
-
-    line_1 = order_with_lines.lines.first()
-    variant_1 = line_1.variant
-    product_1 = variant_1.product
-    variant_channel_listing_1 = variant_1.channel_listings.get(channel=channel)
-    price_1 = variant_1.get_price(
-        product_1, [], channel, variant_channel_listing_1, None
-    )
-    price_1 = TaxedMoney(net=price_1, gross=price_1)
-
-    line_2 = order_with_lines.lines.last()
-    variant_2 = line_2.variant
-    product_2 = variant_2.product
-    variant_channel_listing_2 = variant_2.channel_listings.get(channel=channel)
-    price_2 = variant_2.get_price(
-        product_2, [], channel, variant_channel_listing_2, None
-    )
-    price_2 = TaxedMoney(net=price_2, gross=price_2)
-
-    mocked_calculate_order_line_unit.side_effect = [
-        OrderTaxedPricesData(
-            undiscounted_price=price_1,
-            price_with_discounts=price_1,
-        ),
-        OrderTaxedPricesData(
-            undiscounted_price=price_2,
-            price_with_discounts=price_2,
-        ),
-    ]
-
-    shipping_price = order_with_lines.shipping_method.channel_listings.get(
-        channel_id=order_with_lines.channel_id
-    ).price
-    shipping_price = TaxedMoney(net=shipping_price, gross=shipping_price)
-
-    update_order_prices(
-        order_with_lines, manager, site_settings.include_taxes_in_prices
-    )
-
-    line_1.refresh_from_db()
-    line_2.refresh_from_db()
-    assert line_1.unit_price == price_1
-    assert line_2.unit_price == price_2
-    assert order_with_lines.shipping_price == shipping_price
-    assert order_with_lines.shipping_tax_rate == Decimal("0.0")
-    total = line_1.total_price + line_2.total_price + shipping_price
-    assert order_with_lines.total == total
-
-
-def test_update_order_prices_tax_included(order_with_lines, vatlayer, site_settings):
-    manager = get_plugins_manager()
-
-    channel = order_with_lines.channel
-    address = order_with_lines.shipping_address
-    address.country = "DE"
-    address.save()
-
-    line_1 = order_with_lines.lines.first()
-    variant_1 = line_1.variant
-    product_1 = variant_1.product
-    variant_channel_listing_1 = variant_1.channel_listings.get(channel=channel)
-    price_1 = variant_1.get_price(
-        product_1, [], channel, variant_channel_listing_1, None
-    )
-    line_1.unit_price_gross = price_1
-    line_1.save()
-
-    line_2 = order_with_lines.lines.last()
-    variant_2 = line_2.variant
-    product_2 = variant_2.product
-    variant_channel_listing_2 = variant_2.channel_listings.get(channel=channel)
-    price_2 = variant_2.get_price(
-        product_2, [], channel, variant_channel_listing_2, None
-    )
-    line_2.unit_price_gross = price_2
-    line_2.save()
-
-    shipping_price = order_with_lines.shipping_method.channel_listings.get(
-        channel_id=order_with_lines.channel_id
-    ).price
-
-    update_order_prices(
-        order_with_lines, manager, site_settings.include_taxes_in_prices
-    )
-
-    line_1.refresh_from_db()
-    line_2.refresh_from_db()
-    assert line_1.unit_price.gross == price_1
-    assert line_2.unit_price.gross == price_2
-    assert order_with_lines.shipping_price.gross == shipping_price
-    assert order_with_lines.shipping_tax_rate == Decimal("0.19")
-    total = line_1.total_price + line_2.total_price + order_with_lines.shipping_price
-    assert order_with_lines.total == total
-
-
 def _calculate_order_weight_from_lines(order):
     weight = zero_weight()
     for line in order.lines.all():
@@ -667,16 +570,16 @@ def test_calculate_order_weight(order_with_lines):
     assert calculated_weight == order_weight
 
 
-def test_order_weight_add_more_variant(order_with_lines, info, site_settings):
+def test_order_weight_add_more_variant(order_with_lines, anonymous_plugins):
     variant = order_with_lines.lines.first().variant
+    line_data = OrderLineData(variant_id=str(variant.id), variant=variant, quantity=2)
+
     add_variant_to_order(
-        order_with_lines,
-        variant,
-        2,
-        info.context.user,
-        info.context.app,
-        info.context.plugins,
-        site_settings,
+        order=order_with_lines,
+        line_data=line_data,
+        user=None,
+        app=None,
+        manager=anonymous_plugins,
     )
     order_with_lines.refresh_from_db()
 
@@ -685,17 +588,20 @@ def test_order_weight_add_more_variant(order_with_lines, info, site_settings):
     )
 
 
-def test_order_weight_add_new_variant(order_with_lines, product, info, site_settings):
+def test_order_weight_add_new_variant(
+    order_with_lines,
+    product,
+    anonymous_plugins,
+):
     variant = product.variants.first()
+    line_data = OrderLineData(variant_id=str(variant.id), variant=variant, quantity=2)
 
     add_variant_to_order(
-        order_with_lines,
-        variant,
-        2,
-        info.context.user,
-        info.context.app,
-        info.context.plugins,
-        site_settings,
+        order=order_with_lines,
+        line_data=line_data,
+        user=None,
+        app=None,
+        manager=anonymous_plugins,
     )
     order_with_lines.refresh_from_db()
 
@@ -715,8 +621,8 @@ def test_order_weight_change_line_quantity(staff_user, lines_info):
         line_info,
         new_quantity,
         line_info.quantity,
-        order.channel.slug,
-        get_plugins_manager(),
+        order.channel,
+        get_plugins_manager(allow_replica=False),
     )
     assert order.weight == _calculate_order_weight_from_lines(order)
 
@@ -724,50 +630,54 @@ def test_order_weight_change_line_quantity(staff_user, lines_info):
 def test_order_weight_delete_line(lines_info):
     order = lines_info[0].line.order
     line_info = lines_info[0]
-    delete_order_line(line_info, get_plugins_manager())
+    delete_order_line(line_info, get_plugins_manager(allow_replica=False))
     assert order.weight == _calculate_order_weight_from_lines(order)
 
 
 def test_get_order_weight_non_existing_product(
-    order_with_lines, product, info, site_settings
+    order_with_lines,
+    product,
+    anonymous_plugins,
 ):
     # Removing product should not affect order's weight
     order = order_with_lines
     variant = product.variants.first()
+    line_data = OrderLineData(variant_id=str(variant.id), variant=variant, quantity=1)
+
     add_variant_to_order(
-        order,
-        variant,
-        1,
-        info.context.user,
-        info.context.app,
-        info.context.plugins,
-        site_settings,
+        order=order,
+        line_data=line_data,
+        user=None,
+        app=None,
+        manager=anonymous_plugins,
     )
-    old_weight = order.get_total_weight()
+    old_weight = order.weight
 
     product.delete()
 
     order.refresh_from_db()
-    new_weight = order.get_total_weight()
+    new_weight = order.weight
 
     assert old_weight == new_weight
 
 
-@patch("saleor.discount.utils.validate_voucher")
+@patch("saleor.discount.utils.voucher.validate_voucher")
 def test_get_voucher_discount_for_order_voucher_validation(
     mock_validate_voucher, voucher, order_with_lines
 ):
     order_with_lines.voucher = voucher
     order_with_lines.save()
-    subtotal = order_with_lines.get_subtotal()
+    subtotal = order_with_lines.subtotal
     quantity = order_with_lines.get_total_quantity()
     customer_email = order_with_lines.get_customer_email()
 
-    validate_voucher_in_order(order_with_lines)
+    validate_voucher_in_order(
+        order_with_lines, order_with_lines.lines.all(), order_with_lines.channel
+    )
 
     mock_validate_voucher.assert_called_once_with(
         voucher,
-        subtotal,
+        subtotal.gross,
         quantity,
         customer_email,
         order_with_lines.channel,
@@ -775,7 +685,7 @@ def test_get_voucher_discount_for_order_voucher_validation(
     )
 
 
-@patch("saleor.discount.utils.validate_voucher")
+@patch("saleor.discount.utils.voucher.validate_voucher")
 def test_validate_voucher_in_order_without_voucher(
     mock_validate_voucher, order_with_lines
 ):
@@ -784,209 +694,10 @@ def test_validate_voucher_in_order_without_voucher(
 
     assert not order_with_lines.voucher
 
-    validate_voucher_in_order(order_with_lines)
+    validate_voucher_in_order(
+        order_with_lines, order_with_lines.lines.all(), order_with_lines.channel
+    )
     mock_validate_voucher.assert_not_called()
-
-
-@pytest.mark.parametrize(
-    "subtotal, discount_value, discount_type, min_spent_amount, expected_value",
-    [
-        ("100", 10, DiscountValueType.FIXED, None, 10),
-        ("100.05", 10, DiscountValueType.PERCENTAGE, 100, 10),
-    ],
-)
-def test_value_voucher_order_discount(
-    subtotal,
-    discount_value,
-    discount_type,
-    min_spent_amount,
-    expected_value,
-    channel_USD,
-):
-    voucher = Voucher.objects.create(
-        code="unique",
-        type=VoucherType.ENTIRE_ORDER,
-        discount_value_type=discount_type,
-    )
-    VoucherChannelListing.objects.create(
-        voucher=voucher,
-        channel=channel_USD,
-        discount=Money(discount_value, channel_USD.currency_code),
-        min_spent_amount=(min_spent_amount if min_spent_amount is not None else None),
-    )
-    subtotal = Money(subtotal, "USD")
-    subtotal = TaxedMoney(net=subtotal, gross=subtotal)
-    order = Mock(
-        get_subtotal=Mock(return_value=subtotal), voucher=voucher, channel=channel_USD
-    )
-    discount = get_voucher_discount_for_order(order)
-    assert discount == Money(expected_value, "USD")
-
-
-@pytest.mark.parametrize(
-    "shipping_cost, discount_value, discount_type, expected_value",
-    [(10, 50, DiscountValueType.PERCENTAGE, 5), (10, 20, DiscountValueType.FIXED, 10)],
-)
-def test_shipping_voucher_order_discount(
-    shipping_cost, discount_value, discount_type, expected_value, channel_USD
-):
-    voucher = Voucher.objects.create(
-        code="unique",
-        type=VoucherType.SHIPPING,
-        discount_value_type=discount_type,
-    )
-    VoucherChannelListing.objects.create(
-        voucher=voucher,
-        channel=channel_USD,
-        discount=Money(discount_value, channel_USD.currency_code),
-    )
-    subtotal = Money(100, "USD")
-    subtotal = TaxedMoney(net=subtotal, gross=subtotal)
-    shipping_total = TaxedMoney(
-        gross=Money(shipping_cost, "USD"), net=Money(shipping_cost, "USD")
-    )
-    order = Mock(
-        get_subtotal=Mock(return_value=subtotal),
-        shipping_price=shipping_total,
-        voucher=voucher,
-        channel=channel_USD,
-    )
-    discount = get_voucher_discount_for_order(order)
-    assert discount == Money(expected_value, "USD")
-
-
-@pytest.mark.parametrize(
-    "total, total_quantity, min_spent_amount, min_checkout_items_quantity,"
-    "voucher_type",
-    [
-        (99, 10, 100, 10, VoucherType.SHIPPING),
-        (100, 9, 100, 10, VoucherType.SHIPPING),
-        (99, 9, 100, 10, VoucherType.SHIPPING),
-        (99, 10, 100, 10, VoucherType.ENTIRE_ORDER),
-        (100, 9, 100, 10, VoucherType.ENTIRE_ORDER),
-        (99, 9, 100, 10, VoucherType.ENTIRE_ORDER),
-        (99, 10, 100, 10, VoucherType.SPECIFIC_PRODUCT),
-        (100, 9, 100, 10, VoucherType.SPECIFIC_PRODUCT),
-        (99, 9, 100, 10, VoucherType.SPECIFIC_PRODUCT),
-    ],
-)
-def test_shipping_voucher_checkout_discount_not_applicable_returns_zero(
-    total,
-    total_quantity,
-    min_spent_amount,
-    min_checkout_items_quantity,
-    voucher_type,
-    channel_USD,
-):
-    voucher = Voucher.objects.create(
-        code="unique",
-        type=voucher_type,
-        discount_value_type=DiscountValueType.FIXED,
-        min_checkout_items_quantity=min_checkout_items_quantity,
-    )
-    VoucherChannelListing.objects.create(
-        voucher=voucher,
-        channel=channel_USD,
-        discount=Money(10, channel_USD.currency_code),
-        min_spent_amount=(min_spent_amount if min_spent_amount is not None else None),
-    )
-    price = Money(total, "USD")
-    price = TaxedMoney(net=price, gross=price)
-    order = Mock(
-        get_subtotal=Mock(return_value=price),
-        get_total_quantity=Mock(return_value=total_quantity),
-        shipping_price=price,
-        voucher=voucher,
-        channel=channel_USD,
-    )
-    with pytest.raises(NotApplicable):
-        get_voucher_discount_for_order(order)
-
-
-@pytest.mark.parametrize(
-    "discount_value, discount_type, apply_once_per_order, discount_amount",
-    [
-        (5, DiscountValueType.FIXED, True, "5"),
-        (5, DiscountValueType.FIXED, False, "25"),
-        (10000, DiscountValueType.FIXED, True, "12.3"),
-        (10000, DiscountValueType.FIXED, False, "86.1"),
-        (10, DiscountValueType.PERCENTAGE, True, "1.23"),
-        (10, DiscountValueType.PERCENTAGE, False, "8.61"),
-    ],
-)
-def test_get_discount_for_order_specific_products_voucher(
-    order_with_lines,
-    discount_value,
-    discount_type,
-    apply_once_per_order,
-    discount_amount,
-    channel_USD,
-):
-    voucher = Voucher.objects.create(
-        code="unique",
-        type=VoucherType.SPECIFIC_PRODUCT,
-        discount_value_type=discount_type,
-        apply_once_per_order=apply_once_per_order,
-    )
-    VoucherChannelListing.objects.create(
-        voucher=voucher,
-        channel=channel_USD,
-        discount=Money(discount_value, channel_USD.currency_code),
-    )
-    voucher.products.add(order_with_lines.lines.first().variant.product)
-    voucher.products.add(order_with_lines.lines.last().variant.product)
-    order_with_lines.voucher = voucher
-    order_with_lines.save()
-    discount = get_voucher_discount_for_order(order_with_lines)
-    assert discount == Money(discount_amount, "USD")
-
-
-def test_product_voucher_checkout_discount_raises_not_applicable(
-    order_with_lines, product_with_images, channel_USD
-):
-    discounted_product = product_with_images
-    voucher = Voucher.objects.create(
-        code="unique",
-        type=VoucherType.SPECIFIC_PRODUCT,
-        discount_value_type=DiscountValueType.FIXED,
-    )
-    VoucherChannelListing.objects.create(
-        voucher=voucher,
-        channel=channel_USD,
-        discount=Money(10, channel_USD.currency_code),
-    )
-    voucher.save()
-    voucher.products.add(discounted_product)
-    order_with_lines.voucher = voucher
-    order_with_lines.save()
-    # Offer is valid only for products listed in voucher
-    with pytest.raises(NotApplicable):
-        get_voucher_discount_for_order(order_with_lines)
-
-
-def test_category_voucher_checkout_discount_raises_not_applicable(
-    order_with_lines, channel_USD
-):
-    discounted_collection = Collection.objects.create(
-        name="Discounted", slug="discount"
-    )
-    voucher = Voucher.objects.create(
-        code="unique",
-        type=VoucherType.SPECIFIC_PRODUCT,
-        discount_value_type=DiscountValueType.FIXED,
-    )
-    VoucherChannelListing.objects.create(
-        voucher=voucher,
-        channel=channel_USD,
-        discount=Money(10, channel_USD.currency_code),
-    )
-    voucher.save()
-    voucher.collections.add(discounted_collection)
-    order_with_lines.voucher = voucher
-    order_with_lines.save()
-    # Discount should be valid only for items in the discounted collections
-    with pytest.raises(NotApplicable):
-        get_voucher_discount_for_order(order_with_lines)
 
 
 def test_ordered_item_change_quantity(staff_user, transactional_db, lines_info):
@@ -999,8 +710,8 @@ def test_ordered_item_change_quantity(staff_user, transactional_db, lines_info):
         lines_info[1],
         lines_info[1].quantity,
         0,
-        order.channel.slug,
-        get_plugins_manager(),
+        order.channel,
+        get_plugins_manager(allow_replica=False),
     )
     change_order_line_quantity(
         staff_user,
@@ -1008,8 +719,8 @@ def test_ordered_item_change_quantity(staff_user, transactional_db, lines_info):
         lines_info[0],
         lines_info[0].quantity,
         0,
-        order.channel.slug,
-        get_plugins_manager(),
+        order.channel,
+        get_plugins_manager(allow_replica=False),
     )
     assert order.get_total_quantity() == 0
 
@@ -1028,15 +739,15 @@ def test_change_order_line_quantity_changes_total_prices(
         line_info,
         line_info.quantity,
         new_quantity,
-        order.channel.slug,
-        get_plugins_manager(),
+        order.channel,
+        get_plugins_manager(allow_replica=False),
     )
     assert line_info.line.total_price == line_info.line.unit_price * new_quantity
 
 
 @patch("saleor.plugins.manager.PluginsManager.notify")
 @pytest.mark.parametrize(
-    "has_standard,has_digital", ((True, True), (True, False), (False, True))
+    ("has_standard", "has_digital"), [(True, True), (True, False), (False, True)]
 )
 def test_send_fulfillment_order_lines_mails_by_user(
     mocked_notify,
@@ -1047,7 +758,7 @@ def test_send_fulfillment_order_lines_mails_by_user(
     has_standard,
     has_digital,
 ):
-    manager = get_plugins_manager()
+    manager = get_plugins_manager(allow_replica=False)
     redirect_url = "http://localhost.pl"
     order = fulfilled_order
     order.redirect_url = redirect_url
@@ -1069,18 +780,22 @@ def test_send_fulfillment_order_lines_mails_by_user(
         order=order, fulfillment=fulfillment, user=staff_user, app=None, manager=manager
     )
     expected_payload = get_default_fulfillment_payload(order, fulfillment)
-    expected_payload["requester_user_id"] = staff_user.id
+    expected_payload["requester_user_id"] = to_global_id_or_none(staff_user)
     expected_payload["requester_app_id"] = None
-    mocked_notify.assert_called_once_with(
-        "order_fulfillment_confirmation",
-        payload=expected_payload,
-        channel_slug=fulfilled_order.channel.slug,
-    )
+
+    assert mocked_notify.call_count == 1
+    call_args = mocked_notify.call_args_list[0]
+    called_args = call_args.args
+    called_kwargs = call_args.kwargs
+    assert called_args[0] == "order_fulfillment_confirmation"
+    assert len(called_kwargs) == 2
+    assert called_kwargs["payload_func"]() == expected_payload
+    assert called_kwargs["channel_slug"] == fulfilled_order.channel.slug
 
 
 @patch("saleor.plugins.manager.PluginsManager.notify")
 @pytest.mark.parametrize(
-    "has_standard,has_digital", ((True, True), (True, False), (False, True))
+    ("has_standard", "has_digital"), [(True, True), (True, False), (False, True)]
 )
 def test_send_fulfillment_order_lines_mails_by_app(
     mocked_notify,
@@ -1091,7 +806,7 @@ def test_send_fulfillment_order_lines_mails_by_app(
     has_standard,
     has_digital,
 ):
-    manager = get_plugins_manager()
+    manager = get_plugins_manager(allow_replica=False)
     redirect_url = "http://localhost.pl"
     order = fulfilled_order
     order.redirect_url = redirect_url
@@ -1114,16 +829,20 @@ def test_send_fulfillment_order_lines_mails_by_app(
     )
     expected_payload = get_default_fulfillment_payload(order, fulfillment)
     expected_payload["requester_user_id"] = None
-    expected_payload["requester_app_id"] = app.id
-    mocked_notify.assert_called_once_with(
-        "order_fulfillment_confirmation",
-        payload=expected_payload,
-        channel_slug=fulfilled_order.channel.slug,
-    )
+    expected_payload["requester_app_id"] = to_global_id_or_none(app)
+
+    assert mocked_notify.call_count == 1
+    call_args = mocked_notify.call_args_list[0]
+    called_args = call_args.args
+    called_kwargs = call_args.kwargs
+    assert called_args[0] == "order_fulfillment_confirmation"
+    assert len(called_kwargs) == 2
+    assert called_kwargs["payload_func"]() == expected_payload
+    assert called_kwargs["channel_slug"] == fulfilled_order.channel.slug
 
 
 @pytest.mark.parametrize(
-    "event_fun, expected_event_type",
+    ("event_fun", "expected_event_type"),
     [
         (event_order_confirmation_notification, OrderEventsEmails.ORDER_CONFIRMATION),
         (event_payment_confirmed_notification, OrderEventsEmails.PAYMENT),
@@ -1147,7 +866,7 @@ def test_email_sent_event_with_user(order, event_fun, expected_event_type):
 
 
 @pytest.mark.parametrize(
-    "event_fun, expected_event_type",
+    ("event_fun", "expected_event_type"),
     [
         (event_order_cancelled_notification, OrderEventsEmails.ORDER_CANCEL),
         (event_fulfillment_confirmed_notification, OrderEventsEmails.FULFILLMENT),
@@ -1176,7 +895,7 @@ def test_email_sent_event_with_user_without_app(order, event_fun, expected_event
 
 
 @pytest.mark.parametrize(
-    "event_fun, expected_event_type",
+    ("event_fun", "expected_event_type"),
     [
         (event_order_cancelled_notification, OrderEventsEmails.ORDER_CANCEL),
         (event_fulfillment_confirmed_notification, OrderEventsEmails.FULFILLMENT),
@@ -1204,7 +923,7 @@ def test_email_sent_event_with_app(order, app, event_fun, expected_event_type):
 
 
 @pytest.mark.parametrize(
-    "event_fun, expected_event_type",
+    ("event_fun", "expected_event_type"),
     [
         (event_order_confirmation_notification, OrderEventsEmails.ORDER_CONFIRMATION),
         (event_payment_confirmed_notification, OrderEventsEmails.PAYMENT),
@@ -1227,7 +946,7 @@ def test_email_sent_event_without_user_pk(order, event_fun, expected_event_type)
 
 
 @pytest.mark.parametrize(
-    "event_fun, expected_event_type",
+    ("event_fun", "expected_event_type"),
     [
         (event_order_cancelled_notification, OrderEventsEmails.ORDER_CANCEL),
         (event_fulfillment_confirmed_notification, OrderEventsEmails.FULFILLMENT),
@@ -1270,10 +989,10 @@ GET_ORDER_AVAILABLE_COLLECTION_POINTS = """
 
 
 def test_available_collection_points_for_preorders_variants_in_order(
-    api_client, staff_api_client, order_with_preorder_lines, permission_manage_orders
+    api_client, staff_api_client, order_with_preorder_lines
 ):
     expected_collection_points = list(
-        Warehouse.objects.for_country("US")
+        Warehouse.objects.for_channel(order_with_preorder_lines.channel_id)
         .exclude(
             click_and_collect_option=WarehouseClickAndCollectOption.DISABLED,
         )
@@ -1284,7 +1003,6 @@ def test_available_collection_points_for_preorders_variants_in_order(
         variables={
             "id": graphene.Node.to_global_id("Order", order_with_preorder_lines.id)
         },
-        permissions=[permission_manage_orders],
     )
     response_content = get_graphql_content(response)
     assert (
@@ -1297,10 +1015,9 @@ def test_available_collection_points_for_preorders_and_regular_variants_in_order
     api_client,
     staff_api_client,
     order_with_preorder_lines,
-    permission_manage_orders,
 ):
     expected_collection_points = list(
-        Warehouse.objects.for_country("US")
+        Warehouse.objects.for_channel(order_with_preorder_lines.channel_id)
         .exclude(
             click_and_collect_option=WarehouseClickAndCollectOption.DISABLED,
         )
@@ -1312,10 +1029,352 @@ def test_available_collection_points_for_preorders_and_regular_variants_in_order
         variables={
             "id": graphene.Node.to_global_id("Order", order_with_preorder_lines.id)
         },
-        permissions=[permission_manage_orders],
     )
     response_content = get_graphql_content(response)
     assert (
         expected_collection_points
         == response_content["data"]["order"]["availableCollectionPoints"]
     )
+
+
+def test_order_update_total_authorize_data_with_payment(
+    order_with_lines, payment_txn_preauth
+):
+    # given
+    authorized_amount = payment_txn_preauth.transactions.first().amount
+
+    # when
+    update_order_authorize_data(order_with_lines)
+
+    # then
+    order_with_lines.refresh_from_db()
+    assert order_with_lines.total_authorized == Money(
+        authorized_amount, order_with_lines.currency
+    )
+
+
+def test_order_update_total_authorize_data_with_transaction_item(order_with_lines):
+    # given
+    first_authorized_amount = Decimal(10)
+    order_with_lines.payment_transactions.create(
+        authorized_value=first_authorized_amount,
+        charged_value=Decimal(12),
+        currency=order_with_lines.currency,
+    )
+    second_authorized_amount = Decimal(3)
+    order_with_lines.payment_transactions.create(
+        authorized_value=second_authorized_amount,
+        charged_value=Decimal(12),
+        currency=order_with_lines.currency,
+    )
+
+    # when
+    update_order_authorize_data(order_with_lines)
+
+    # then
+    order_with_lines.refresh_from_db()
+    assert order_with_lines.total_authorized == Money(
+        first_authorized_amount + second_authorized_amount, order_with_lines.currency
+    )
+
+
+def test_order_update_total_authorize_data_with_transaction_item_and_payment(
+    order_with_lines, payment_txn_preauth
+):
+    # given
+    first_authorized_amount = payment_txn_preauth.transactions.first().amount
+
+    second_authorized_amount = Decimal(3)
+    order_with_lines.payment_transactions.create(
+        authorized_value=second_authorized_amount,
+        charged_value=Decimal(12),
+        currency=order_with_lines.currency,
+    )
+
+    # when
+    update_order_authorize_data(order_with_lines)
+
+    # then
+    order_with_lines.refresh_from_db()
+    assert order_with_lines.total_authorized == Money(
+        first_authorized_amount + second_authorized_amount, order_with_lines.currency
+    )
+
+
+def test_order_update_charge_data_with_payment(order_with_lines, payment_txn_captured):
+    # given
+    charged_amount = payment_txn_captured.transactions.first().amount
+
+    # when
+    update_order_charge_data(order_with_lines)
+
+    # then
+    order_with_lines.refresh_from_db()
+    assert order_with_lines.total_charged == Money(
+        charged_amount, order_with_lines.currency
+    )
+
+
+def test_order_update_charge_data_with_transaction_item(order_with_lines):
+    # given
+    first_charged_amount = Decimal(10)
+    order_with_lines.payment_transactions.create(
+        charged_value=first_charged_amount,
+        authorized_value=Decimal(12),
+        currency=order_with_lines.currency,
+    )
+    second_charged_amount = Decimal(3)
+    order_with_lines.payment_transactions.create(
+        authorized_value=Decimal(11),
+        charged_value=second_charged_amount,
+        currency=order_with_lines.currency,
+    )
+
+    # when
+    update_order_charge_data(order_with_lines)
+
+    # then
+    order_with_lines.refresh_from_db()
+    assert order_with_lines.total_charged == Money(
+        first_charged_amount + second_charged_amount, order_with_lines.currency
+    )
+
+
+def test_order_update_charge_data_with_transaction_item_and_payment(
+    order_with_lines, payment_txn_captured
+):
+    # given
+    first_charged_amount = payment_txn_captured.transactions.first().amount
+    second_charged_amount = Decimal(3)
+    order_with_lines.payment_transactions.create(
+        authorized_value=Decimal(11),
+        charged_value=second_charged_amount,
+        currency=order_with_lines.currency,
+    )
+
+    # when
+    update_order_charge_data(order_with_lines)
+
+    # then
+    order_with_lines.refresh_from_db()
+    assert order_with_lines.total_charged == Money(
+        first_charged_amount + second_charged_amount, order_with_lines.currency
+    )
+
+
+def test_add_variant_to_order_adds_line_for_new_variant_on_promotion_with_custom_price(
+    order_with_lines,
+    product,
+    anonymous_plugins,
+    catalogue_promotion_without_rules,
+):
+    # given
+    order = order_with_lines
+    variant = product.variants.first()
+
+    reward_value = Decimal("5")
+    rule = catalogue_promotion_without_rules.rules.create(
+        catalogue_predicate={
+            "productPredicate": {
+                "ids": [graphene.Node.to_global_id("Product", variant.product.id)]
+            }
+        },
+        reward_value_type=RewardValueType.FIXED,
+        reward_value=reward_value,
+    )
+    rule.channels.add(order.channel)
+
+    channel_listing = variant.channel_listings.get(channel=order.channel)
+    channel_listing.discounted_price_amount = (
+        channel_listing.price.amount - reward_value
+    )
+    channel_listing.save(update_fields=["discounted_price_amount"])
+
+    listing_rule = channel_listing.variantlistingpromotionrule.create(
+        promotion_rule=rule,
+        discount_amount=reward_value,
+        currency=channel_listing.channel.currency_code,
+    )
+
+    lines_before = order.lines.count()
+    price_override = Decimal(15)
+    line_data = OrderLineData(
+        variant_id=str(variant.id),
+        variant=variant,
+        quantity=1,
+        price_override=price_override,
+        rules_info=[
+            VariantPromotionRuleInfo(
+                rule=rule,
+                variant_listing_promotion_rule=listing_rule,
+                promotion=catalogue_promotion_without_rules,
+                promotion_translation=None,
+                rule_translation=None,
+            )
+        ],
+    )
+
+    # when
+    add_variant_to_order(
+        order=order,
+        line_data=line_data,
+        user=None,
+        app=None,
+        manager=anonymous_plugins,
+    )
+
+    # then
+    line = order.lines.last()
+    variant_channel_listing = variant.channel_listings.get(channel=order.channel)
+    assert order.lines.count() == lines_before + 1
+    assert line.product_sku == variant.sku
+    assert line.quantity == 1
+    assert variant_channel_listing.price_amount != price_override
+    unit_amount = price_override - reward_value
+    assert line.unit_price == TaxedMoney(
+        net=Money(unit_amount, "USD"), gross=Money(unit_amount, "USD")
+    )
+    assert line.variant_name == str(variant)
+    assert line.product_name == str(variant.product)
+
+    assert line.unit_discount_amount == reward_value
+    assert line.unit_discount_value == reward_value
+
+    assert line.discounts.count() == 1
+    assert line.discounts.first().promotion_rule == rule
+
+
+def test_add_variant_to_order_adds_line_with_custom_price_for_new_variant(
+    order_with_lines,
+    product,
+    anonymous_plugins,
+):
+    # given
+    order = order_with_lines
+    variant = product.variants.get()
+    lines_before = order.lines.count()
+    price_override = Decimal(18)
+    line_data = OrderLineData(
+        variant_id=str(variant.id),
+        variant=variant,
+        quantity=1,
+        price_override=price_override,
+    )
+
+    # when
+    add_variant_to_order(
+        order=order,
+        line_data=line_data,
+        user=None,
+        app=None,
+        manager=anonymous_plugins,
+    )
+
+    # then
+    variant_channel_listing = variant.channel_listings.get(channel=order.channel)
+    line = order.lines.last()
+    assert order.lines.count() == lines_before + 1
+    assert variant_channel_listing.price_amount != price_override
+    assert line.product_sku == variant.sku
+    assert line.product_variant_id == variant.get_global_id()
+    assert line.quantity == 1
+    assert line.unit_price == TaxedMoney(
+        net=Money(price_override, "USD"), gross=Money(price_override, "USD")
+    )
+    assert line.variant_name == str(variant)
+    assert line.product_name == str(variant.product)
+    assert line.base_unit_price_amount == price_override
+    assert line.undiscounted_base_unit_price_amount == price_override
+    assert not line.unit_discount_amount
+    assert not line.unit_discount_value
+    assert not line.unit_discount_reason
+
+
+def test_add_variant_to_order_adds_translations_in_order_language(
+    order_with_lines,
+    product,
+    product_translation_fr,
+    variant_translation_fr,
+    settings,
+    anonymous_plugins,
+):
+    # given
+    language_code = "fr"
+    settings.LANGUAGE_CODE = "es"
+
+    order = order_with_lines
+    order.language_code = language_code
+    order.save(update_fields=["language_code"])
+    variant = variant_translation_fr.product_variant
+    line_data = OrderLineData(variant_id=str(variant.id), variant=variant, quantity=1)
+
+    # when
+    add_variant_to_order(
+        order=order,
+        line_data=line_data,
+        user=None,
+        app=None,
+        manager=anonymous_plugins,
+    )
+
+    # then
+    line = order.lines.last()
+    assert line.quantity == 1
+    assert (
+        line.translated_product_name
+        == get_translation(variant.product, language_code).name
+    )
+    assert line.translated_variant_name == get_translation(variant, language_code).name
+
+
+@pytest.mark.parametrize(
+    ("granted_refund_amount", "charged_amount", "expected_charge_status"),
+    [
+        # granted refund contains part of the order's total, charge amount is 0
+        (Decimal("10.40"), Decimal("0"), OrderChargeStatus.NONE),
+        # granted refund covers the whole order's total, charge amount is 0
+        # status is FULL, as the order total - granted refund amount is 0.
+        # It means that a charge amount equal to 0 fully covers the order total (0)
+        (Decimal("98.40"), Decimal("0"), OrderChargeStatus.FULL),
+        (Decimal("0"), Decimal("0"), OrderChargeStatus.NONE),
+        (Decimal("0"), Decimal("11.00"), OrderChargeStatus.PARTIAL),
+        (Decimal("4"), Decimal("11.00"), OrderChargeStatus.PARTIAL),
+        # granted refund covers 88.40 of total, which is 98.40. Charge amount is 10.
+        # status is FULL, as the order total - granted refund amount is 10.
+        (Decimal("88.40"), Decimal("10.00"), OrderChargeStatus.FULL),
+        (Decimal("0"), Decimal("98.40"), OrderChargeStatus.FULL),
+        # granted refund covers 88.40 of total, which is 98.40. Charge amount is 98.40.
+        # status is OVERCHARGED as the charge amount is greater than the order
+        # total - granted refund amount
+        (Decimal("88.40"), Decimal("98.40"), OrderChargeStatus.OVERCHARGED),
+    ],
+)
+def test_order_update_charge_status_with_transaction_item_and_granted_refund(
+    granted_refund_amount,
+    charged_amount,
+    expected_charge_status,
+    order_with_lines,
+    staff_user,
+):
+    # given
+    assert order_with_lines.total.gross.amount == Decimal("98.40")
+    order_with_lines.payment_transactions.create(
+        charged_value=charged_amount,
+        authorized_value=Decimal(12),
+        currency=order_with_lines.currency,
+    )
+
+    order_with_lines.granted_refunds.create(
+        amount_value=granted_refund_amount,
+        currency="USD",
+        reason="Test reason",
+        user=staff_user,
+    )
+
+    # when
+    update_order_charge_data(order_with_lines)
+
+    # then
+    order_with_lines.refresh_from_db()
+
+    assert order_with_lines.charge_status == expected_charge_status

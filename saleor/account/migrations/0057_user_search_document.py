@@ -5,7 +5,6 @@ from django.db import migrations, models
 
 
 class Migration(migrations.Migration):
-
     dependencies = [
         ("account", "0056_merge_20210903_0640"),
     ]
@@ -20,6 +19,7 @@ class Migration(migrations.Migration):
             model_name="user",
             name="user_search_gin",
         ),
+        # nosemgrep: add-index-concurrently
         migrations.AddIndex(
             model_name="user",
             index=django.contrib.postgres.indexes.GinIndex(
@@ -28,6 +28,7 @@ class Migration(migrations.Migration):
                 opclasses=["gin_trgm_ops", "gin_trgm_ops", "gin_trgm_ops"],
             ),
         ),
+        # nosemgrep: add-index-concurrently
         migrations.AddIndex(
             model_name="user",
             index=django.contrib.postgres.indexes.GinIndex(

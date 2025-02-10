@@ -178,8 +178,8 @@ def test_get_braintree_gateway_sandbox(gateway_config):
 
 
 def test_get_braintree_gateway_inproperly_configured(gateway_config):
+    gateway_config.connection_params["private_key"] = None
     with pytest.raises(ImproperlyConfigured):
-        gateway_config.connection_params["private_key"] = None
         get_braintree_gateway(**gateway_config.connection_params)
 
 
@@ -190,7 +190,28 @@ def test_get_client_token(mock_gateway, gateway_config):
     mock_gateway.return_value = Mock(client_token=Mock(generate=mock_generate))
     token = get_client_token(gateway_config)
     mock_gateway.assert_called_once_with(**gateway_config.connection_params)
-    mock_generate.assert_called_once_with()
+    mock_generate.assert_called_once_with({})
+    assert token == expected_token
+
+
+@pytest.fixture
+def gateway_config_with_merchant_account_id(gateway_config):
+    gateway_config.connection_params["merchant_account_id"] = "foobar"
+    return gateway_config
+
+
+@patch("saleor.payment.gateways.braintree.get_braintree_gateway")
+def test_get_client_token_with_merchant_account_id(
+    mock_gateway, gateway_config_with_merchant_account_id
+):
+    expected_token = "client-token"
+    mock_generate = Mock(return_value=expected_token)
+    mock_gateway.return_value = Mock(client_token=Mock(generate=mock_generate))
+    token = get_client_token(gateway_config_with_merchant_account_id)
+    mock_gateway.assert_called_once_with(
+        **gateway_config_with_merchant_account_id.connection_params
+    )
+    mock_generate.assert_called_once_with({"merchant_account_id": "foobar"})
     assert token == expected_token
 
 
@@ -214,6 +235,37 @@ def test_get_client_token_with_customer_id(
         **gateway_config_with_store_enabled.connection_params
     )
     mock_generate.assert_called_once_with({"customer_id": "1234"})
+    assert token == expected_token
+
+
+@pytest.fixture
+def gateway_config_with_merchant_account_id_and_store_enabled(
+    gateway_config_with_merchant_account_id,
+):
+    gateway_config_with_merchant_account_id.store_customer = True
+    return gateway_config_with_merchant_account_id
+
+
+@patch("saleor.payment.gateways.braintree.get_braintree_gateway")
+def test_get_client_token_with_customer_id_and_merchant_account_id(
+    mock_gateway, gateway_config_with_merchant_account_id_and_store_enabled
+):
+    expected_token = "client-token"
+    mock_generate = Mock(return_value=expected_token)
+    mock_gateway.return_value = Mock(client_token=Mock(generate=mock_generate))
+    token = get_client_token(
+        gateway_config_with_merchant_account_id_and_store_enabled,
+        TokenConfig(customer_id="1234"),
+    )
+    mock_gateway.assert_called_once_with(
+        **gateway_config_with_merchant_account_id_and_store_enabled.connection_params
+    )
+    mock_generate.assert_called_once_with(
+        {
+            "customer_id": "1234",
+            "merchant_account_id": "foobar",
+        }
+    )
     assert token == expected_token
 
 
@@ -369,13 +421,8 @@ def test_capture(payment_txn_preauth, sandbox_braintree_gateway_config):
 def test_capture_incorrect_token(payment_txn_preauth, sandbox_braintree_gateway_config):
     payment_info = create_payment_information(payment_txn_preauth, "12345")
     with pytest.raises(BraintreeException) as e:
-        response = capture(payment_info, sandbox_braintree_gateway_config)
-        assert str(e.value) == DEFAULT_ERROR_MESSAGE
-        assert response.raw_response == extract_gateway_response(
-            braintree_error_response
-        )
-        assert not response.is_success
-        assert response.error == DEFAULT_ERROR
+        capture(payment_info, sandbox_braintree_gateway_config)
+    assert str(e.value) == DEFAULT_ERROR_MESSAGE
 
 
 @pytest.mark.integration

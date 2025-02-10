@@ -1,10 +1,10 @@
 from unittest.mock import patch
 
 import graphene
+import pytest
 
 from ....product.error_codes import ProductErrorCode
 from ....product.models import ProductChannelListing
-from ....tests.utils import flush_post_commit_hooks
 from ...tests.utils import (
     assert_negative_positive_decimal_value,
     assert_no_permission,
@@ -13,10 +13,11 @@ from ...tests.utils import (
 
 PRODUCT_VARIANT_CHANNEL_LISTING_UPDATE_MUTATION = """
 mutation UpdateProductVariantChannelListing(
-    $id: ID!,
+    $id: ID,
+    $sku: String,
     $input: [ProductVariantChannelListingAddInput!]!
 ) {
-    productVariantChannelListingUpdate(id: $id, input: $input) {
+    productVariantChannelListingUpdate(id: $id, sku: $sku, input: $input) {
         errors {
             field
             message
@@ -32,6 +33,10 @@ mutation UpdateProductVariantChannelListing(
                     currencyCode
                 }
                 price {
+                    amount
+                    currency
+                }
+                priorPrice {
                     amount
                     currency
                 }
@@ -182,6 +187,76 @@ def test_variant_channel_listing_update_with_too_many_decimal_places_in_price(
 
 
 def test_variant_channel_listing_update_as_staff_user(
+    staff_api_client,
+    product,
+    permission_manage_products,
+    channel_USD,
+    channel_PLN,
+):
+    # given
+    product_pln_channel_listing = ProductChannelListing.objects.create(
+        product=product,
+        channel=channel_PLN,
+        is_published=True,
+    )
+    variant = product.variants.get()
+    variant_id = graphene.Node.to_global_id("ProductVariant", variant.id)
+    channel_usd_id = graphene.Node.to_global_id("Channel", channel_USD.id)
+    channel_pln_id = graphene.Node.to_global_id("Channel", channel_PLN.id)
+    price = 1
+    second_price = 20
+    variables = {
+        "id": variant_id,
+        "input": [
+            {"channelId": channel_usd_id, "price": price, "costPrice": price},
+            {
+                "channelId": channel_pln_id,
+                "price": second_price,
+                "costPrice": second_price,
+            },
+        ],
+    }
+
+    # when
+    response = staff_api_client.post_graphql(
+        PRODUCT_VARIANT_CHANNEL_LISTING_UPDATE_MUTATION,
+        variables=variables,
+        permissions=(permission_manage_products,),
+    )
+    content = get_graphql_content(response)
+
+    # then
+    data = content["data"]["productVariantChannelListingUpdate"]
+    variant_data = data["variant"]
+    assert not data["errors"]
+    assert variant_data["id"] == variant_id
+    channel_usd_data = next(
+        channel_data
+        for channel_data in variant_data["channelListings"]
+        if channel_data["channel"]["id"] == channel_usd_id
+    )
+    channel_pln_data = next(
+        channel_data
+        for channel_data in variant_data["channelListings"]
+        if channel_data["channel"]["id"] == channel_pln_id
+    )
+    assert channel_usd_data["price"]["currency"] == "USD"
+    assert channel_usd_data["price"]["amount"] == price
+    assert channel_usd_data["costPrice"]["amount"] == price
+    assert channel_usd_data["channel"]["slug"] == channel_USD.slug
+    assert channel_pln_data["price"]["currency"] == "PLN"
+    assert channel_pln_data["price"]["amount"] == second_price
+    assert channel_pln_data["costPrice"]["amount"] == second_price
+    assert channel_pln_data["channel"]["slug"] == channel_PLN.slug
+    usd_channel_listing = variant.channel_listings.get(channel=channel_USD)
+    pln_channel_listing = variant.channel_listings.get(channel=channel_PLN)
+    assert usd_channel_listing.discounted_price_amount == price
+    assert pln_channel_listing.discounted_price_amount == second_price
+    product_pln_channel_listing.refresh_from_db()
+    assert product_pln_channel_listing.discounted_price_dirty
+
+
+def test_variant_channel_listing_update_by_sku(
     staff_api_client, product, permission_manage_products, channel_USD, channel_PLN
 ):
     # given
@@ -197,7 +272,7 @@ def test_variant_channel_listing_update_as_staff_user(
     price = 1
     second_price = 20
     variables = {
-        "id": variant_id,
+        "sku": variant.sku,
         "input": [
             {"channelId": channel_usd_id, "price": price, "costPrice": price},
             {
@@ -281,7 +356,6 @@ def test_variant_channel_listing_update_trigger_webhook_product_variant_updated(
         permissions=(permission_manage_products,),
     )
     get_graphql_content(response)
-    flush_post_commit_hooks()
 
     # then
     mock_product_variant_updated.assert_called_once_with(product.variants.last())
@@ -399,35 +473,6 @@ def test_variant_channel_listing_update_as_anonymous(
 
     # then
     assert_no_permission(response)
-
-
-@patch("saleor.graphql.product.mutations.channels.update_product_discounted_price_task")
-def test_product_variant_channel_listing_update_updates_discounted_price(
-    mock_update_product_discounted_price_task,
-    staff_api_client,
-    product,
-    permission_manage_products,
-    channel_USD,
-):
-    query = PRODUCT_VARIANT_CHANNEL_LISTING_UPDATE_MUTATION
-    variant = product.variants.get()
-    variant_id = graphene.Node.to_global_id("ProductVariant", variant.id)
-    channel_id = graphene.Node.to_global_id("Channel", channel_USD.id)
-
-    variables = {
-        "id": variant_id,
-        "input": [{"channelId": channel_id, "price": "1.99"}],
-    }
-    response = staff_api_client.post_graphql(
-        query, variables, permissions=[permission_manage_products]
-    )
-    assert response.status_code == 200
-
-    content = get_graphql_content(response)
-    data = content["data"]["productVariantChannelListingUpdate"]
-    assert data["errors"] == []
-
-    mock_update_product_discounted_price_task.delay.assert_called_once_with(product.pk)
 
 
 def test_product_variant_channel_listing_update_remove_cost_price(
@@ -577,3 +622,36 @@ def test_variant_channel_listing_update_preorder(
         channel_pln_data["preorderThreshold"]["quantity"]
         == preorder_threshold_channel_pln
     )
+
+
+@pytest.mark.parametrize("prior_price", [1.5, 0])
+def test_variant_channel_listing_update_with_prior_price(
+    staff_api_client, product, permission_manage_products, channel_USD, prior_price
+):
+    # given
+    price = 1.0
+    variant = product.variants.get()
+    variant_id = graphene.Node.to_global_id("ProductVariant", variant.id)
+    channel_usd_id = graphene.Node.to_global_id("Channel", channel_USD.id)
+    variables = {
+        "id": variant_id,
+        "input": [
+            {"channelId": channel_usd_id, "priorPrice": prior_price, "price": price}
+        ],
+    }
+
+    # when
+    response = staff_api_client.post_graphql(
+        PRODUCT_VARIANT_CHANNEL_LISTING_UPDATE_MUTATION,
+        variables=variables,
+        permissions=(permission_manage_products,),
+    )
+    content = get_graphql_content(response)
+
+    # then
+    data = content["data"]["productVariantChannelListingUpdate"]
+    variant_data = data["variant"]
+    assert not data["errors"]
+    assert variant_data["id"] == variant_id
+    assert variant_data["channelListings"][0]["priorPrice"]["currency"] == "USD"
+    assert variant_data["channelListings"][0]["priorPrice"]["amount"] == prior_price

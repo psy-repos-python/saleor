@@ -42,10 +42,23 @@ FRAGMENT_ORDER_DETAILS = (
         paymentStatus
         paymentStatusDisplay
         status
+        channel {
+          id
+          slug
+        }
         statusDisplay
         canFinalize
         isShippingRequired
         id
+        giftCards {
+          id
+        }
+        invoices {
+          id
+        }
+        payments {
+          id
+        }
         number
         shippingAddress {
           ...Address
@@ -83,6 +96,9 @@ FRAGMENT_ORDER_DETAILS = (
         total {
           ...Price
         }
+        totalCharged {
+          amount
+        }
         totalCaptured {
           amount
         }
@@ -92,6 +108,7 @@ FRAGMENT_ORDER_DETAILS = (
         shippingPrice {
           ...Price
         }
+        displayGrossPrices
       }
     """
 )
@@ -113,7 +130,7 @@ def test_user_order_details(
         """
     )
     variables = {
-        "token": order_with_lines_and_events.token,
+        "token": order_with_lines_and_events.id,
     }
     get_graphql_content(user_api_client.post_graphql(query, variables))
 

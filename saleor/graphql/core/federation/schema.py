@@ -7,6 +7,8 @@ from graphene.utils.str_converters import to_snake_case
 from graphql import GraphQLArgument, GraphQLError, GraphQLField, GraphQLList
 
 from ...channel import ChannelContext
+from ...schema_printer import print_schema
+from .. import ResolveInfo
 from .entities import federated_entities
 
 
@@ -41,12 +43,16 @@ class _Service(graphene.ObjectType):
     sdl = graphene.String()
 
 
-def build_federated_schema(query=None, mutation=None, types=None):
+def build_federated_schema(
+    query, mutation, types, subscription, directives=None
+) -> graphene.Schema:
     """Create GraphQL schema that supports Apollo Federation."""
     schema = graphene.Schema(
         query=query,
         mutation=mutation,
         types=list(types) + [_Any, _Entity, _Service],
+        subscription=subscription,
+        directives=directives,
     )
 
     entity_type = schema.get_type("_Entity")
@@ -73,7 +79,7 @@ def build_federated_schema(query=None, mutation=None, types=None):
 def create_entity_type_resolver(schema):
     """Create type resolver aware of ChannelContext on _Entity union."""
 
-    def resolve_entity_type(instance, info):
+    def resolve_entity_type(instance, info: ResolveInfo):
         # Use new strategy to resolve GraphQL Type for `ObjectType`
         if isinstance(instance, ChannelContext):
             model = type(instance.node)
@@ -92,7 +98,7 @@ def create_entity_type_resolver(schema):
     return resolve_entity_type
 
 
-def resolve_entities(_, info, *, representations):
+def resolve_entities(_, info: ResolveInfo, *, representations):
     max_representations = settings.FEDERATED_QUERY_MAX_ENTITIES
     if max_representations and len(representations) > max_representations:
         representations_count = len(representations)
@@ -107,7 +113,8 @@ def resolve_entities(_, info, *, representations):
             try:
                 model = federated_entities[representation["__typename"]]
                 resolvers[representation["__typename"]] = getattr(
-                    model, "_%s__resolve_references" % representation["__typename"]
+                    model,
+                    "_{}__resolve_references".format(representation["__typename"]),
                 )
             except AttributeError:
                 pass
@@ -133,8 +140,17 @@ def resolve_entities(_, info, *, representations):
 
 
 def create_service_sdl_resolver(schema):
+    # subscriptions are not handled by the federation protocol
+    schema_sans_subscriptions = graphene.Schema(
+        query=schema._query,
+        mutation=schema._mutation,
+        types=schema.types,
+        directives=schema._directives,
+    )
     # Render schema to string
-    federated_schema_sdl = str(schema)
+    federated_schema_sdl = print_schema(schema_sans_subscriptions)
+
+    del schema_sans_subscriptions
 
     # Remove "schema { ... }"
     schema_start = federated_schema_sdl.find("schema {")
@@ -155,7 +171,7 @@ def create_service_sdl_resolver(schema):
             + federated_schema_sdl[type_fields_open:]
         )
 
-    def resolve_service_sdl(*_args):
+    def resolve_service_sdl(_root, _info: ResolveInfo):
         return {"sdl": federated_schema_sdl}
 
     return resolve_service_sdl

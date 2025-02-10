@@ -1,6 +1,5 @@
 import logging
 import os
-from typing import List
 
 from graphene import Node
 
@@ -21,7 +20,7 @@ from .utils import (
 logger = logging.getLogger(__name__)
 
 
-def parse_errors(errors: List[str]) -> str:
+def parse_errors(errors: list[str]) -> str:
     # Field error of Transaction db model has max length of 256
     # Error codes have max length of 11
     # We are limiting errors to maximum of 11 codes, because:
@@ -89,8 +88,9 @@ def tracking_number_updated(fulfillment: Fulfillment, config: ApiConfig) -> None
         elif errors:
             error = ", ".join(errors)
             logger.warning(
-                f"Could not capture payment with id {payment_graphql_id} "
-                f"in NP Atobarai: {error}"
+                "Could not capture payment with id %s in NP Atobarai: %s",
+                payment_graphql_id,
+                error,
             )
             msg = (
                 f"Error: Cannot capture payment with id {payment_graphql_id} ({error})"

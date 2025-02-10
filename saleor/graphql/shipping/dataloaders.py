@@ -1,6 +1,6 @@
 from collections import defaultdict
 
-from django.db.models import F
+from django.db.models import Exists, F, OuterRef, Q
 
 from ...channel.models import Channel
 from ...shipping.models import (
@@ -30,6 +30,33 @@ class ShippingZoneByIdLoader(DataLoader):
             self.database_connection_name
         ).in_bulk(keys)
         return [shipping_zones.get(shipping_zone_id) for shipping_zone_id in keys]
+
+
+class ShippingZonesByChannelIdLoader(DataLoader):
+    context_key = "shippingzone_by_channel_id"
+
+    def batch_load(self, keys):
+        shipping_zones_channel = ShippingZone.channels.through.objects.using(
+            self.database_connection_name
+        ).filter(channel_id__in=keys)
+        shipping_zones_map = (
+            ShippingZone.objects.using(self.database_connection_name)
+            .filter(
+                Exists(shipping_zones_channel.filter(shippingzone_id=OuterRef("pk")))
+            )
+            .in_bulk()
+        )
+
+        shipping_zones_by_channel_map = defaultdict(list)
+        for shipping_zone_id, channel_id in shipping_zones_channel.values_list(
+            "shippingzone_id", "channel_id"
+        ):
+            shipping_zones_by_channel_map[channel_id].append(
+                shipping_zones_map[shipping_zone_id]
+            )
+        return [
+            shipping_zones_by_channel_map.get(channel_id, []) for channel_id in keys
+        ]
 
 
 class ShippingMethodsByShippingZoneIdLoader(DataLoader):
@@ -73,15 +100,20 @@ class ShippingMethodsByShippingZoneIdAndChannelSlugLoader(DataLoader):
     context_key = "shippingmethod_by_shippingzone_and_channel"
 
     def batch_load(self, keys):
+        shipping_zone_ids = [zone_id for (zone_id, _) in keys]
         shipping_methods = (
             ShippingMethod.objects.using(self.database_connection_name)
-            .filter(shipping_zone_id__in=keys)
+            .filter(shipping_zone_id__in=shipping_zone_ids)
             .annotate(channel_slug=F("channel_listings__channel__slug"))
+            .order_by("pk")
         )
 
         shipping_methods_by_shipping_zone_and_channel_map = defaultdict(list)
         for shipping_method in shipping_methods:
-            key = (shipping_method.shipping_zone_id, shipping_method.channel_slug)
+            key = (
+                shipping_method.shipping_zone_id,
+                getattr(shipping_method, "channel_slug"),  # annotation
+            )
             shipping_methods_by_shipping_zone_and_channel_map[key].append(
                 shipping_method
             )
@@ -119,6 +151,7 @@ class ShippingMethodChannelListingByChannelSlugLoader(DataLoader):
             ShippingMethodChannelListing.objects.using(self.database_connection_name)
             .filter(channel__slug__in=keys)
             .annotate(channel_slug=F("channel__slug"))
+            .order_by("pk")
         )
         shipping_method_channel_listings_by_channel_slug = defaultdict(list)
         for shipping_method_channel_listing in shipping_method_channel_listings:
@@ -140,7 +173,9 @@ class ShippingMethodChannelListingByShippingMethodIdAndChannelSlugLoader(DataLoa
 
         def _find_listing_by_shipping_method_id(listings_by_channel):
             listings_by_method = []
-            for method_id, listings in zip(shipping_method_ids, listings_by_channel):
+            for method_id, listings in zip(
+                shipping_method_ids, listings_by_channel, strict=False
+            ):
                 for listing in listings:
                     if method_id == listing.shipping_method_id:
                         listings_by_method.append(listing)
@@ -187,3 +222,23 @@ class ChannelsByShippingZoneIdLoader(DataLoader):
             .load_many({pk for pk, _ in channel_and_zone_is_pairs})
             .then(map_channels)
         )
+
+
+class ShippingZonesByCountryLoader(DataLoader):
+    context_key = "shippingzones_by_country"
+
+    def batch_load(self, keys):
+        lookup = Q()
+        for key in keys:
+            lookup |= Q(countries__contains=key)
+        shipping_zones = ShippingZone.objects.using(
+            self.database_connection_name
+        ).filter(lookup)
+
+        shipping_zones_by_country = defaultdict(list)
+        for shipping_zone in shipping_zones:
+            for country_code in keys:
+                if country_code in shipping_zone.countries:
+                    shipping_zones_by_country[country_code].append(shipping_zone)
+
+        return [shipping_zones_by_country[key] for key in keys]

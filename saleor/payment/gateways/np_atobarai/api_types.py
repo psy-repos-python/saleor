@@ -1,6 +1,6 @@
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Dict, List, NamedTuple, Optional
+from typing import NamedTuple
 
 from .const import (
     FILL_MISSING_ADDRESS,
@@ -17,11 +17,12 @@ from .const import (
 
 class NPResponse(NamedTuple):
     result: dict
-    error_codes: List[str]
+    error_codes: list[str]
+    raw_response: dict
 
 
 def error_np_response(error_message: str) -> NPResponse:
-    return NPResponse({}, [error_message])
+    return NPResponse({}, [error_message], {})
 
 
 @dataclass
@@ -45,17 +46,21 @@ class PaymentStatus(str, Enum):
 @dataclass
 class PaymentResult:
     status: PaymentStatus
-    psp_reference: Optional[str] = None
-    raw_response: Dict[str, str] = field(default_factory=dict)
-    errors: List[str] = field(default_factory=list)
+    psp_reference: str | None = None
+    raw_response: dict[str, str] = field(default_factory=dict)
+    errors: list[str] = field(default_factory=list)
 
 
 def error_payment_result(error_message: str) -> PaymentResult:
-    return PaymentResult(status=PaymentStatus.FAILED, errors=[error_message])
+    return PaymentResult(
+        status=PaymentStatus.FAILED, errors=[error_message], raw_response={}
+    )
 
 
-def errors_payment_result(errors: List[str]) -> PaymentResult:
-    return PaymentResult(status=PaymentStatus.FAILED, errors=errors)
+def errors_payment_result(errors: list[str], response: dict) -> PaymentResult:
+    return PaymentResult(
+        status=PaymentStatus.FAILED, errors=errors, raw_response=response
+    )
 
 
 def get_api_config(connection_params: dict) -> ApiConfig:

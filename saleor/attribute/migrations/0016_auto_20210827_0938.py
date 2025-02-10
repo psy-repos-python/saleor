@@ -5,7 +5,6 @@ from django.db import migrations
 
 
 class Migration(migrations.Migration):
-
     dependencies = [
         ("attribute", "0015_auto_20210817_1015"),
     ]
@@ -15,6 +14,7 @@ class Migration(migrations.Migration):
             model_name="attributevalue",
             name="attribute_a_name_9f3448_gin",
         ),
+        # nosemgrep: add-index-concurrently
         migrations.AddIndex(
             model_name="attributevalue",
             index=django.contrib.postgres.indexes.GinIndex(

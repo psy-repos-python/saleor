@@ -2,6 +2,7 @@ from unittest.mock import patch
 
 from Adyen.client import AdyenResult
 from django.core.exceptions import ValidationError
+from django.utils import timezone
 
 from ......payment import ChargeStatus
 from ......payment.gateways.adyen.webhooks import handle_api_response
@@ -27,7 +28,12 @@ def test_handle_api_response_auto_capture_order_created_can_refund(
         }
     )
 
-    handle_api_response(payment_adyen_for_checkout, adyen_response, plugin.channel.slug)
+    handle_api_response(
+        payment_adyen_for_checkout,
+        payment_adyen_for_checkout.checkout,
+        adyen_response,
+        plugin.channel.slug,
+    )
 
     payment_adyen_for_checkout.refresh_from_db()
 
@@ -59,7 +65,12 @@ def test_handle_api_response_auto_capture_false_order_created_can_void(
         }
     )
 
-    handle_api_response(payment_adyen_for_checkout, adyen_response, plugin.channel.slug)
+    handle_api_response(
+        payment_adyen_for_checkout,
+        payment_adyen_for_checkout.checkout,
+        adyen_response,
+        plugin.channel.slug,
+    )
 
     payment_adyen_for_checkout.refresh_from_db()
 
@@ -93,7 +104,12 @@ def test_handle_api_response_auto_capture_false_cannot_create_order_void_payment
         }
     )
 
-    handle_api_response(payment_adyen_for_checkout, adyen_response, plugin.channel.slug)
+    handle_api_response(
+        payment_adyen_for_checkout,
+        payment_adyen_for_checkout.checkout,
+        adyen_response,
+        plugin.channel.slug,
+    )
 
     payment_adyen_for_checkout.refresh_from_db()
 
@@ -129,7 +145,12 @@ def test_handle_api_response_auto_capture_cannot_create_order_refund_payment(
         }
     )
 
-    handle_api_response(payment_adyen_for_checkout, adyen_response, plugin.channel.slug)
+    handle_api_response(
+        payment_adyen_for_checkout,
+        payment_adyen_for_checkout.checkout,
+        adyen_response,
+        plugin.channel.slug,
+    )
 
     payment_adyen_for_checkout.refresh_from_db()
 
@@ -153,6 +174,8 @@ def test_handle_api_response_auto_capture_cannot_create_order_variant_deleted(
 
     checkout = payment_adyen_for_checkout.checkout
     checkout.lines.first().delete()
+    checkout.price_expiration = timezone.now()
+    checkout.save(update_fields=["price_expiration"])
 
     plugin = adyen_plugin(adyen_auto_capture=True)
 
@@ -166,7 +189,12 @@ def test_handle_api_response_auto_capture_cannot_create_order_variant_deleted(
         }
     )
 
-    handle_api_response(payment_adyen_for_checkout, adyen_response, plugin.channel.slug)
+    handle_api_response(
+        payment_adyen_for_checkout,
+        payment_adyen_for_checkout.checkout,
+        adyen_response,
+        plugin.channel.slug,
+    )
 
     payment_adyen_for_checkout.refresh_from_db()
 

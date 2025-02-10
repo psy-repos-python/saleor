@@ -1,14 +1,56 @@
+from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 from django.conf import settings
+from django.db.models import Exists, OuterRef
 
+from ..app.models import App
 from ..checkout import AddressType
-from ..core.utils import create_thumbnails
-from .models import User
+from ..core.utils.events import call_event
+from ..permission.models import Permission
+from ..plugins.manager import get_plugins_manager
+from .models import Group, User
 
 if TYPE_CHECKING:
     from ..plugins.manager import PluginsManager
     from .models import Address
+
+
+@dataclass
+class RequestorAwareContext:
+    allow_replica: bool
+    user: User | None = None
+    app: App | None = None
+
+    @property
+    def META(self):
+        return {}
+
+    @staticmethod
+    def _get_or_none(model, pk_value):
+        return (
+            model.objects.using(settings.DATABASE_CONNECTION_REPLICA_NAME)
+            .filter(pk=pk_value)
+            .first()
+            if pk_value
+            else None
+        )
+
+    @classmethod
+    def from_context_data(cls, context_data):
+        return cls(
+            allow_replica=context_data["allow_replica"],
+            user=cls._get_or_none(User, context_data["user_pk"]),
+            app=cls._get_or_none(App, context_data["app_pk"]),
+        )
+
+    @staticmethod
+    def create_context_data(context):
+        return {
+            "allow_replica": context.allow_replica,
+            "user_pk": context.user.pk if context.user else None,
+            "app_pk": context.app.pk if context.app else None,
+        }
 
 
 def store_user_address(
@@ -88,7 +130,6 @@ def change_user_default_address(
 
 
 def create_superuser(credentials):
-
     user, created = User.objects.get_or_create(
         email=credentials["email"],
         defaults={"is_active": True, "is_staff": True, "is_superuser": True},
@@ -96,12 +137,9 @@ def create_superuser(credentials):
     if created:
         user.set_password(credentials["password"])
         user.save()
-        create_thumbnails(
-            pk=user.pk, model=User, size_set="user_avatars", image_attr="avatar"
-        )
-        msg = "Superuser - %(email)s/%(password)s" % credentials
+        msg = f"Superuser - {credentials['email']}/{credentials['password']}"
     else:
-        msg = "Superuser already exists - %(email)s" % credentials
+        msg = f"Superuser already exists - {credentials['email']}"
     return msg
 
 
@@ -116,3 +154,45 @@ def remove_staff_member(staff):
         staff.save()
     else:
         staff.delete()
+
+
+def retrieve_user_by_email(email):
+    """Retrieve user by email.
+
+    Email lookup is case-insensitive, unless the query returns more than one user. In
+    such a case, function return case-sensitive result.
+    """
+    users = list(User.objects.filter(email__iexact=email))
+
+    if len(users) > 1:
+        users_exact = [user for user in users if user.email == email]
+        users_iexact = [user for user in users if user.email == email.lower()]
+        users = users_exact or users_iexact
+
+    if users:
+        return users[0]
+    return None
+
+
+def get_user_groups_permissions(user: User):
+    GroupUser = User.groups.through
+    group_users = GroupUser._default_manager.filter(user_id=user.id).values("group_id")
+    GroupPermissions = Group.permissions.through
+    group_permissions = GroupPermissions.objects.filter(
+        Exists(group_users.filter(group_id=OuterRef("group_id")))
+    ).values("permission_id")
+    return Permission.objects.filter(
+        Exists(group_permissions.filter(permission_id=OuterRef("id")))
+    )
+
+
+def send_user_event(user: User, created: bool, updated: bool):
+    """Send created or updated event for user."""
+    manager = get_plugins_manager(allow_replica=False)
+    event = None
+    if created:
+        event = manager.staff_created if user.is_staff else manager.customer_created
+    elif updated:
+        event = manager.staff_updated if user.is_staff else manager.customer_updated
+    if event:
+        call_event(event, user)

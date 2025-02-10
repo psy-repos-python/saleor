@@ -1,19 +1,24 @@
 import graphene
 from django.core.exceptions import ValidationError
+from django.db.models.expressions import Exists, OuterRef
 
 from ...attribute import AttributeInputType
 from ...attribute import models as attribute_models
-from ...core.permissions import PagePermissions, PageTypePermissions
 from ...core.tracing import traced_atomic_transaction
 from ...page import models
+from ...permission.enums import PagePermissions, PageTypePermissions
+from ...webhook.event_types import WebhookEventAsyncType
+from ...webhook.utils import get_webhooks_for_event
+from ..core import ResolveInfo
 from ..core.mutations import BaseBulkMutation, ModelBulkDeleteMutation
-from ..core.types.common import PageError
+from ..core.types import NonNullList, PageError
+from ..plugins.dataloaders import get_plugin_manager_promise
 from .types import Page, PageType
 
 
 class PageBulkDelete(ModelBulkDeleteMutation):
     class Arguments:
-        ids = graphene.List(
+        ids = NonNullList(
             graphene.ID, required=True, description="List of page IDs to delete."
         )
 
@@ -27,25 +32,34 @@ class PageBulkDelete(ModelBulkDeleteMutation):
 
     @classmethod
     @traced_atomic_transaction()
-    def perform_mutation(cls, _root, info, ids, **data):
+    def perform_mutation(  # type: ignore[override]
+        cls, _root, info: ResolveInfo, /, *, ids
+    ):
         try:
             pks = cls.get_global_ids_or_error(ids, only_type=Page, field="pk")
         except ValidationError as error:
             return 0, error
         cls.delete_assigned_attribute_values(pks)
-        return super().perform_mutation(_root, info, ids, **data)
+        return super().perform_mutation(_root, info, ids=ids)
 
     @staticmethod
     def delete_assigned_attribute_values(instance_pks):
+        assigned_values = attribute_models.AssignedPageAttributeValue.objects.filter(
+            page_id__in=instance_pks
+        )
+        attributes = attribute_models.Attribute.objects.filter(
+            input_type__in=AttributeInputType.TYPES_WITH_UNIQUE_VALUES
+        )
+
         attribute_models.AttributeValue.objects.filter(
-            pageassignments__page_id__in=instance_pks,
-            attribute__input_type__in=AttributeInputType.TYPES_WITH_UNIQUE_VALUES,
+            Exists(assigned_values.filter(value_id=OuterRef("id"))),
+            Exists(attributes.filter(id=OuterRef("attribute_id"))),
         ).delete()
 
 
 class PageBulkPublish(BaseBulkMutation):
     class Arguments:
-        ids = graphene.List(
+        ids = NonNullList(
             graphene.ID, required=True, description="List of page IDs to (un)publish."
         )
         is_published = graphene.Boolean(
@@ -61,14 +75,16 @@ class PageBulkPublish(BaseBulkMutation):
         error_type_field = "page_errors"
 
     @classmethod
-    def bulk_action(cls, info, queryset, is_published):
+    def bulk_action(  # type: ignore[override]
+        cls, _info: ResolveInfo, queryset, /, is_published
+    ):
         queryset.update(is_published=is_published)
 
 
 class PageTypeBulkDelete(ModelBulkDeleteMutation):
     class Arguments:
-        ids = graphene.List(
-            graphene.NonNull(graphene.ID),
+        ids = NonNullList(
+            graphene.ID,
             description="List of page type IDs to delete",
             required=True,
         )
@@ -83,17 +99,35 @@ class PageTypeBulkDelete(ModelBulkDeleteMutation):
 
     @classmethod
     @traced_atomic_transaction()
-    def perform_mutation(cls, _root, info, ids, **data):
+    def perform_mutation(  # type: ignore[override]
+        cls, _root, info: ResolveInfo, /, ids
+    ):
         try:
             pks = cls.get_global_ids_or_error(ids, only_type=PageType, field="pk")
         except ValidationError as error:
             return 0, error
         cls.delete_assigned_attribute_values(pks)
-        return super().perform_mutation(_root, info, ids, **data)
+        return super().perform_mutation(_root, info, ids=ids)
+
+    @classmethod
+    def bulk_action(cls, info: ResolveInfo, queryset, /):
+        page_types = list(queryset)
+        queryset.delete()
+        manager = get_plugin_manager_promise(info.context).get()
+        webhooks = get_webhooks_for_event(WebhookEventAsyncType.PAGE_TYPE_DELETED)
+        for pt in page_types:
+            cls.call_event(manager.page_type_deleted, pt, webhooks=webhooks)
 
     @staticmethod
     def delete_assigned_attribute_values(instance_pks):
+        assigned_values = attribute_models.AssignedPageAttributeValue.objects.filter(
+            page__page_type_id__in=instance_pks
+        )
+        attributes = attribute_models.Attribute.objects.filter(
+            input_type__in=AttributeInputType.TYPES_WITH_UNIQUE_VALUES
+        )
+
         attribute_models.AttributeValue.objects.filter(
-            pageassignments__assignment__page_type_id__in=instance_pks,
-            attribute__input_type__in=AttributeInputType.TYPES_WITH_UNIQUE_VALUES,
+            Exists(assigned_values.filter(value_id=OuterRef("id"))),
+            Exists(attributes.filter(id=OuterRef("attribute_id"))),
         ).delete()

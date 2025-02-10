@@ -5,7 +5,7 @@ from unittest.mock import patch
 import pytest
 
 from .....order.actions import create_refund_fulfillment
-from .....order.utils import recalculate_order
+from .....order.tests.fixtures import recalculate_order
 from .....plugins.manager import get_plugins_manager
 from .....plugins.models import PluginConfiguration
 from ....interface import AddressData, PaymentLineData, PaymentLinesData
@@ -56,7 +56,8 @@ def np_atobarai_plugin(settings, monkeypatch, channel_USD):
             configuration=configuration,
         )
 
-        manager = get_plugins_manager()
+        manager = get_plugins_manager(allow_replica=False)
+        manager.get_all_plugins()
         return manager.plugins_per_channel[channel_USD.slug][0]
 
     return fun
@@ -97,6 +98,8 @@ def np_address_data():
         city_area="本宿",
         street_address_1="2-16-3",
         street_address_2="",
+        metadata={},
+        private_metadata={},
     )
 
 
@@ -162,7 +165,7 @@ def create_refund(payment_dummy):
                 payment=payment_dummy,
                 order_lines_to_refund=order_lines or [],
                 fulfillment_lines_to_refund=fulfillment_lines or [],
-                manager=get_plugins_manager(),
+                manager=get_plugins_manager(allow_replica=False),
                 amount=manual_refund_amount,
                 refund_shipping_costs=refund_shipping_costs,
             )

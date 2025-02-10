@@ -1,4 +1,4 @@
-from datetime import timedelta
+import datetime
 
 import pytest
 from django.utils import timezone
@@ -105,13 +105,13 @@ def products_for_variant_filtering(product_type, category):
                 product=products[6],
                 sku="Preorder-V2",
                 is_preorder=True,
-                preorder_end_date=timezone.now() + timedelta(days=1),
+                preorder_end_date=timezone.now() + datetime.timedelta(days=1),
             ),
             ProductVariant(
                 product=products[6],
                 sku="Preorder-V3",
                 is_preorder=True,
-                preorder_end_date=timezone.now() - timedelta(days=1),
+                preorder_end_date=timezone.now() - datetime.timedelta(days=1),
             ),
         ]
     )
@@ -119,7 +119,7 @@ def products_for_variant_filtering(product_type, category):
 
 
 @pytest.mark.parametrize(
-    "filter_by, variants",
+    ("filter_by", "variants"),
     [
         ({"search": "Product1"}, ["P1-V1", "P1-V2", "PP1-V1"]),
         ({"search": "Product3"}, ["P3-V1"]),
@@ -189,7 +189,7 @@ def test_products_pagination_with_filtering(
 
 
 @pytest.mark.parametrize(
-    "variants_filter, count",
+    ("variants_filter", "count"),
     [
         ({"updatedAt": {"gte": "2012-01-14T10:59:00+00:00"}}, 2),
         ({"updatedAt": {"lte": "2012-01-14T12:00:05+00:00"}}, 2),

@@ -5,7 +5,6 @@ from django.db import migrations, models
 
 
 class Migration(migrations.Migration):
-
     dependencies = [
         ("checkout", "0038_merge_20210903_1048"),
         ("product", "0153_merge_20211006_0910"),
@@ -48,6 +47,7 @@ class Migration(migrations.Migration):
                 "ordering": ("pk",),
             },
         ),
+        # nosemgrep: add-index-concurrently
         migrations.AddIndex(
             model_name="preorderreservation",
             index=models.Index(
