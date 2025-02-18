@@ -1,12 +1,15 @@
 import logging
+from collections.abc import Iterable
 from decimal import Decimal
-from typing import TYPE_CHECKING, Iterable, List, Optional, Tuple
+from typing import TYPE_CHECKING
 
 import requests
+from django.conf import settings
 from django.utils import timezone
 from posuto import Posuto
 from requests.auth import HTTPBasicAuth
 
+from ....core.http_client import HTTPClient
 from ....order.models import Order
 from ... import PaymentError
 from ...interface import AddressData, PaymentData, PaymentLineData, RefundData
@@ -46,42 +49,44 @@ def _request(
     config: "ApiConfig",
     method: str,
     path: str = "",
-    json: Optional[dict] = None,
+    json: dict | None = None,
 ) -> requests.Response:
     trace_name = f"np-atobarai.request.{path.lstrip('/')}"
     with np_atobarai_opentracing_trace(trace_name):
-        response = requests.request(
-            method=method,
-            url=get_url(config, path),
-            timeout=REQUEST_TIMEOUT,
+        response = HTTPClient.send_request(
+            method,
+            get_url(config, path),
+            timeout=(settings.REQUESTS_CONN_EST_TIMEOUT, REQUEST_TIMEOUT),
             json=json or {},
             auth=HTTPBasicAuth(config.merchant_code, config.sp_code),
             headers={"X-NP-Terminal-Id": config.terminal_id},
+            allow_redirects=False,
         )
         # NP Atobarai returns error codes with http status code 400
         # Because we want to pass those errors to the end user,
         # we treat 400 as valid response.
         if 400 < response.status_code <= 600:
-            raise requests.HTTPError
+            raise requests.HTTPError(request=response.request, response=response)
         return response
 
 
 def np_request(
-    config: "ApiConfig", method: str, path: str = "", json: Optional[dict] = None
+    config: "ApiConfig", method: str, path: str = "", json: dict | None = None
 ) -> NPResponse:
+    response_data = {}
     try:
         response = _request(config, method, path, json)
         response_data = response.json()
         if "errors" in response_data:
-            return NPResponse({}, response_data["errors"][0]["codes"])
-        return NPResponse(response_data["results"][0], [])
+            return NPResponse({}, response_data["errors"][0]["codes"], response_data)
+        return NPResponse(response_data["results"][0], [], response_data)
     except requests.RequestException:
         logger.warning("Cannot connect to NP Atobarai.", exc_info=True)
-        return NPResponse({}, [NP_CONNECTION_ERROR])
+        return NPResponse({}, [NP_CONNECTION_ERROR], response_data)
 
 
 def handle_unrecoverable_state(
-    order: Optional[Order],
+    order: Order | None,
     action: str,
     transaction_id: str,
     error_codes: Iterable[str],
@@ -105,7 +110,7 @@ def format_name(ad: AddressData) -> str:
     return f"{ad.last_name}　{ad.first_name}".strip()
 
 
-def format_address(config: "ApiConfig", ad: AddressData) -> Optional[str]:
+def format_address(config: "ApiConfig", ad: AddressData) -> str | None:
     """Follow the Japanese address guidelines."""
     # example: "東京都千代田区麹町４－２－６　住友不動産麹町ファーストビル５階"
     if not config.fill_missing_address:
@@ -133,7 +138,7 @@ def format_price(price: Decimal, currency: str) -> int:
 def _get_goods_name(line: PaymentLineData, config: "ApiConfig") -> str:
     if not config.sku_as_name:
         return line.product_name
-    elif sku := line.product_sku:
+    if sku := line.product_sku:
         return sku
     return str(line.variant_id)
 
@@ -141,7 +146,7 @@ def _get_goods_name(line: PaymentLineData, config: "ApiConfig") -> str:
 def _get_voucher_and_shipping_goods(
     config: "ApiConfig",
     payment_information: PaymentData,
-) -> List[dict]:
+) -> list[dict]:
     """Convert voucher and shipping amount into NP Atobarai goods lines."""
     goods_lines = []
     voucher_amount = payment_information.lines_data.voucher_amount
@@ -174,7 +179,7 @@ def get_goods_with_refunds(
     config: "ApiConfig",
     payment: Payment,
     payment_information: PaymentData,
-) -> Tuple[List[dict], Decimal]:
+) -> tuple[list[dict], Decimal]:
     """Combine PaymentLinesData and RefundData into NP Atobarai's goods list.
 
     Used for payment updates.
@@ -230,7 +235,7 @@ def get_goods_with_refunds(
     return goods_lines, billed_amount
 
 
-def get_goods(config: "ApiConfig", payment_information: PaymentData) -> List[dict]:
+def get_goods(config: "ApiConfig", payment_information: PaymentData) -> list[dict]:
     """Convert PaymentLinesData into NP Atobarai's goods list.
 
     Used for initial payment registration only.
@@ -253,8 +258,8 @@ def cancel(config: "ApiConfig", transaction_id: str) -> NPResponse:
 def register(
     config: "ApiConfig",
     payment_information: "PaymentData",
-    billed_amount: Optional[int] = None,
-    goods: Optional[List[dict]] = None,
+    billed_amount: int | None = None,
+    goods: list[dict] | None = None,
 ) -> NPResponse:
     if billed_amount is None:
         billed_amount = format_price(
@@ -314,9 +319,9 @@ def register(
 
 def report(
     config: "ApiConfig",
-    shipping_company_code: Optional[str],
-    psp_reference: Optional[str],
-    shipping_slip_number: Optional[str],
+    shipping_company_code: str | None,
+    psp_reference: str | None,
+    shipping_slip_number: str | None,
 ) -> NPResponse:
     if not shipping_company_code:
         return error_np_response(SHIPPING_COMPANY_CODE_INVALID)

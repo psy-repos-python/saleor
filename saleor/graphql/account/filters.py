@@ -9,7 +9,7 @@ from ..core.filters import (
     MetadataFilterBase,
     ObjectTypeFilter,
 )
-from ..core.types.common import DateRangeInput, DateTimeRangeInput, IntRangeInput
+from ..core.types import DateRangeInput, DateTimeRangeInput, IntRangeInput
 from ..utils.filters import filter_by_id, filter_range_field
 from . import types as account_types
 from .enums import StaffMemberStatus
@@ -29,7 +29,7 @@ def filter_number_of_orders(qs, _, value):
 
 
 def filter_placed_orders(qs, _, value):
-    return filter_range_field(qs, "orders__created__date", value)
+    return filter_range_field(qs, "orders__created_at__date", value)
 
 
 def filter_staff_status(qs, _, value):
@@ -51,6 +51,7 @@ def filter_search(qs, _, value):
 
 
 class CustomerFilter(MetadataFilterBase):
+    ids = GlobalIDMultipleChoiceFilter(field_name="id", help_text="Filter by ids.")
     date_joined = ObjectTypeFilter(
         input_class=DateRangeInput, method=filter_date_joined
     )

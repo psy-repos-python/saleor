@@ -1,14 +1,15 @@
 import json
-from decimal import Decimal
-from typing import Any, Dict, Iterable, List, Optional, Tuple, Union, cast
+from collections.abc import Callable, Iterable
+from decimal import Decimal, InvalidOperation
+from typing import TYPE_CHECKING, Any
 
 import graphene
 from django.conf import settings
 from django.db.models import Model as DjangoModel
 from django.db.models import Q, QuerySet
 from graphene.relay import Connection
-from graphql import GraphQLError, ResolveInfo
-from graphql.language.ast import FragmentSpread
+from graphql import GraphQLError
+from graphql.language.ast import FragmentSpread, InlineFragment, SelectionSet
 from graphql_relay.connection.arrayconnection import connection_from_list_slice
 from graphql_relay.connection.connectiontypes import Edge, PageInfo
 from graphql_relay.utils import base64, unbase64
@@ -17,13 +18,20 @@ from ...channel.exceptions import ChannelNotDefined, NoDefaultChannel
 from ..channel import ChannelContext, ChannelQsContext
 from ..channel.utils import get_default_channel_slug_or_graphql_error
 from ..core.enums import OrderDirection
+from ..core.types import BaseConnection, NonNullList
 from ..utils.sorting import sort_queryset_for_connection
+from .context import SyncWebhookControlContext
 
-ConnectionArguments = Dict[str, Any]
+if TYPE_CHECKING:
+    from ..core import ResolveInfo
+
+ConnectionArguments = dict[str, Any]
 
 EPSILON = Decimal("0.000001")
 FILTERS_NAME = "_FILTERS_NAME"
 FILTERSET_CLASS = "_FILTERSET_CLASS"
+WHERE_NAME = "_WHERE_NAME"
+WHERE_FILTERSET_CLASS = "_WHERE_FILTERSET_CLASS"
 
 
 def to_global_cursor(values):
@@ -33,7 +41,7 @@ def to_global_cursor(values):
     return base64(json.dumps(values))
 
 
-def from_global_cursor(cursor) -> List[str]:
+def from_global_cursor(cursor) -> list[str]:
     values = unbase64(cursor)
     return json.loads(values)
 
@@ -41,24 +49,48 @@ def from_global_cursor(cursor) -> List[str]:
 def get_field_value(instance: DjangoModel, field_name: str):
     """Get field value for given field in filter format 'field__foreign_key_field'."""
     field_path = field_name.split("__")
-    attr = instance
+    attr: Any = instance
     for elem in field_path:
-        attr = getattr(attr, elem, None)  # type:ignore
+        attr = getattr(attr, elem, None)
 
     if callable(attr):
-        return "%s" % attr()
+        return f"{attr()}"
     return attr
+
+
+def _prepare_filter_by_rank_expression(
+    cursor: list[str],
+    sorting_direction: str,
+    coerce_id: Callable[[str], Any],
+) -> Q:
+    if len(cursor) != 2:
+        raise GraphQLError("Received cursor is invalid.")
+    try:
+        rank = Decimal(cursor[0])
+        id = coerce_id(cursor[1])
+    except (InvalidOperation, ValueError, TypeError) as e:
+        raise GraphQLError("Received cursor is invalid.") from e
+
+    # Because rank is float number, it gets mangled by PostgreSQL's query parser
+    # making equal comparisons impossible. Instead we compare rank against small
+    # range of values, constructed using epsilon.
+    if sorting_direction == "gt":
+        return Q(search_rank__range=(rank - EPSILON, rank + EPSILON), id__gt=id) | Q(
+            search_rank__gt=rank + EPSILON
+        )
+    return Q(search_rank__range=(rank - EPSILON, rank + EPSILON), id__lt=id) | Q(
+        search_rank__lt=rank - EPSILON
+    )
 
 
 def _prepare_filter_expression(
     field_name: str,
     index: int,
-    cursor: List[str],
-    sorting_fields: List[str],
+    cursor: list[str],
+    sorting_fields: list[str],
     sorting_direction: str,
-) -> Tuple[Q, Dict[str, Union[str, bool]]]:
-
-    field_expression: Dict[str, Union[str, bool]] = {}
+) -> tuple[Q, dict[str, str | bool]]:
+    field_expression: dict[str, str | bool] = {}
     extra_expression = Q()
     for cursor_id, cursor_value in enumerate(cursor[:index]):
         field_expression[sorting_fields[cursor_id]] = cursor_value
@@ -75,7 +107,10 @@ def _prepare_filter_expression(
 
 
 def _prepare_filter(
-    cursor: List[str], sorting_fields: List[str], sorting_direction: str
+    cursor: list[str],
+    sorting_fields: list[str],
+    sorting_direction: str,
+    coerce_id: Callable[[str], Any],
 ) -> Q:
     """Create filter arguments based on sorting fields.
 
@@ -91,6 +126,9 @@ def _prepare_filter(
                 ('first_field', 'first_value_form_cursor'))
         )
     """
+    if sorting_fields == ["search_rank", "id"]:
+        # Fast path for filtering by rank
+        return _prepare_filter_by_rank_expression(cursor, sorting_direction, coerce_id)
     filter_kwargs = Q()
     for index, field_name in enumerate(sorting_fields):
         if cursor[index] is None and sorting_direction == "gt":
@@ -125,9 +163,9 @@ def _get_sorting_fields(sort_by, qs):
     sorting_attribute = sort_by.get("attribute_id")
     if sorting_fields and not isinstance(sorting_fields, list):
         return [sorting_fields]
-    elif not sorting_fields and sorting_attribute is not None:
+    if not sorting_fields and sorting_attribute is not None:
         return qs.model.sort_by_attribute_fields()
-    elif not sorting_fields:
+    if not sorting_fields:
         raise ValueError("Error while preparing cursor values.")
     return sorting_fields
 
@@ -151,12 +189,12 @@ def _get_page_info(matching_records, cursor, first, last):
     records_left = False
     if requested_count is not None:
         records_left = len(matching_records) > requested_count
-    has_pages_before = True if cursor else False
+    has_other_pages = bool(cursor)
     if first:
         page_info["has_next_page"] = records_left
-        page_info["has_previous_page"] = has_pages_before
+        page_info["has_previous_page"] = has_other_pages
     elif last:
-        page_info["has_next_page"] = has_pages_before
+        page_info["has_next_page"] = has_other_pages
         page_info["has_previous_page"] = records_left
 
     return page_info
@@ -181,7 +219,7 @@ def _get_edges_for_connection(edge_type, qs, args, sorting_fields):
 
     matching_records = list(qs)
     if last:
-        matching_records = list(reversed(matching_records))
+        matching_records.reverse()
         if len(matching_records) <= requested_count:
             start_slice = 0
     page_info = _get_page_info(matching_records, cursor, first, last)
@@ -202,9 +240,13 @@ def _get_edges_for_connection(edge_type, qs, args, sorting_fields):
     return edges, page_info
 
 
+def _get_id_coercion(qs: QuerySet) -> Callable[[str], Any]:
+    return qs.model.id.field.to_python if hasattr(qs.model, "id") else int
+
+
 def connection_from_queryset_slice(
     qs: QuerySet,
-    args: ConnectionArguments = None,
+    args: ConnectionArguments | None = None,
     connection_type: Any = Connection,
     edge_type: Any = Edge,
     pageinfo_type: Any = PageInfo,
@@ -223,8 +265,8 @@ def connection_from_queryset_slice(
     cursor = after or before
     try:
         cursor = from_global_cursor(cursor) if cursor else None
-    except ValueError:
-        raise GraphQLError("Received cursor is invalid.")
+    except ValueError as e:
+        raise GraphQLError("Received cursor is invalid.") from e
 
     sort_by = args.get("sort_by", {})
     sorting_fields = _get_sorting_fields(sort_by, qs)
@@ -232,9 +274,19 @@ def connection_from_queryset_slice(
     if cursor and len(cursor) != len(sorting_fields):
         raise GraphQLError("Received cursor is invalid.")
     filter_kwargs = (
-        _prepare_filter(cursor, sorting_fields, sorting_direction) if cursor else Q()
+        _prepare_filter(
+            cursor,
+            sorting_fields,
+            sorting_direction,
+            _get_id_coercion(qs),
+        )
+        if cursor
+        else Q()
     )
-    filtered_qs = qs.filter(filter_kwargs)
+    try:
+        filtered_qs = qs.filter(filter_kwargs)
+    except ValueError as e:
+        raise GraphQLError("Received cursor is invalid.") from e
     filtered_qs = filtered_qs[:end_margin]
     edges, page_info = _get_edges_for_connection(
         edge_type, filtered_qs, args, sorting_fields
@@ -259,12 +311,12 @@ def connection_from_queryset_slice(
 
 def create_connection_slice(
     iterable,
-    info,
+    info: "ResolveInfo",
     args,
     connection_type,
     edge_type=None,
     pageinfo_type=graphene.relay.PageInfo,
-    max_limit: Optional[int] = None,
+    max_limit: int | None = None,
 ):
     _validate_slice_args(info, args, max_limit)
 
@@ -282,16 +334,22 @@ def create_connection_slice(
     else:
         queryset = iterable
 
-    queryset, sort_by = sort_queryset_for_connection(iterable=queryset, args=args)
+    allow_replica = getattr(info.context, "allow_replica", False)
+    queryset, sort_by = sort_queryset_for_connection(
+        iterable=queryset, args=args, allow_replica=allow_replica
+    )
     args["sort_by"] = sort_by
 
-    slice = connection_from_queryset_slice(
-        queryset,
-        args,
-        connection_type,
-        edge_type or connection_type.Edge,
-        pageinfo_type or graphene.relay.PageInfo,
-    )
+    from ...core.db.connection import allow_writer_in_context
+
+    with allow_writer_in_context(info.context):
+        slice = connection_from_queryset_slice(
+            queryset,
+            args,
+            connection_type,
+            edge_type or connection_type.Edge,
+            pageinfo_type or graphene.relay.PageInfo,
+        )
 
     if isinstance(iterable, ChannelQsContext):
         edges_with_context = []
@@ -305,9 +363,9 @@ def create_connection_slice(
 
 
 def _validate_slice_args(
-    info: ResolveInfo,
+    info: "ResolveInfo",
     args: dict,
-    max_limit: Optional[int] = None,
+    max_limit: int | None = None,
 ):
     enforce_first_or_last = _is_first_or_last_required(info)
 
@@ -321,35 +379,38 @@ def _validate_slice_args(
         )
 
     if max_limit is None:
-        max_limit = cast(int, settings.GRAPHENE.get("RELAY_CONNECTION_MAX_LIMIT", 0))
+        max_limit = settings.GRAPHQL_PAGINATION_LIMIT
 
     if max_limit:
         if first:
             assert first <= max_limit, (
-                "Requesting {} records on the `{}` connection exceeds the "
-                "`first` limit of {} records."
-            ).format(first, info.field_name, max_limit)
+                f"Requesting {first} records on the `{info.field_name}` connection "
+                f"exceeds the `first` limit of {max_limit} records."
+            )
             args["first"] = min(first, max_limit)
 
         if last:
             assert last <= max_limit, (
-                "Requesting {} records on the `{}` connection exceeds the "
-                "`last` limit of {} records."
-            ).format(last, info.field_name, max_limit)
+                f"Requesting {last} records on the `{info.field_name}` connection "
+                f"exceeds the `last` limit of {max_limit} records."
+            )
             args["last"] = min(last, max_limit)
 
 
-def _is_first_or_last_required(info):
-    """Disable `enforce_first_or_last` if not querying for `edges`."""
-    selections = info.field_asts[0].selection_set.selections
-    values = [field.name.value for field in selections]
+def _edges_in_selections(selection_set: SelectionSet, info: "ResolveInfo") -> bool:
+    values = [
+        field.name.value
+        for field in selection_set.selections
+        if not isinstance(field, InlineFragment)
+    ]
     if "edges" in values:
         return True
 
     fragments = [
-        field.name.value for field in selections if isinstance(field, FragmentSpread)
+        field.name.value
+        for field in selection_set.selections
+        if isinstance(field, FragmentSpread)
     ]
-
     for fragment in fragments:
         fragment_values = [
             field.name.value
@@ -358,7 +419,22 @@ def _is_first_or_last_required(info):
         if "edges" in fragment_values:
             return True
 
+    sub_selection_sets = [
+        field.selection_set
+        for field in selection_set.selections
+        if isinstance(field, InlineFragment)
+    ]
+    for sub_selection_set in sub_selection_sets:
+        if _edges_in_selections(sub_selection_set, info):
+            return True
+
     return False
+
+
+def _is_first_or_last_required(info: "ResolveInfo") -> bool:
+    """Disable `enforce_first_or_last` if not querying for `edges`."""
+    selection_set = info.field_asts[0].selection_set
+    return _edges_in_selections(selection_set, info)
 
 
 def slice_connection_iterable(
@@ -387,44 +463,217 @@ def slice_connection_iterable(
     return slice
 
 
-def filter_connection_queryset(iterable, args, request=None, root=None):
-    filterset_class = args[FILTERSET_CLASS]
-    filter_field_name = args[FILTERS_NAME]
-    filter_input = args.get(filter_field_name)
-
-    if filter_input:
-        # for nested filters get channel from ChannelContext object
-        if "channel" not in args and root and hasattr(root, "channel_slug"):
-            args["channel"] = root.channel_slug
-
-        try:
-            filter_channel = str(filter_input["channel"])
-        except (NoDefaultChannel, ChannelNotDefined, GraphQLError, KeyError):
-            filter_channel = None
-        filter_input["channel"] = (
-            args.get("channel")
-            or filter_channel
-            or get_default_channel_slug_or_graphql_error()
+def filter_connection_queryset(
+    iterable, args, request=None, root=None, allow_replica=False
+):
+    update_args_with_channel(args, root)
+    if args.get(args[FILTERS_NAME]) and args.get(args[WHERE_NAME]):
+        raise GraphQLError(
+            "Only one filtering argument (filter or where) can be specified."
         )
 
-        if isinstance(iterable, ChannelQsContext):
-            queryset = iterable.qs
-        else:
-            queryset = iterable
+    if filter_input := args.get(args[FILTERS_NAME]):
+        filterset_class = args[FILTERSET_CLASS]
+        filter_func = filter_qs
+    else:
+        filter_input = args.get(args[WHERE_NAME])
+        filterset_class = args[WHERE_FILTERSET_CLASS]
+        filter_func = where_filter_qs
 
-        filterset = filterset_class(filter_input, queryset=queryset, request=request)
-        if not filterset.is_valid():
-            raise GraphQLError(json.dumps(filterset.errors.get_json_data()))
-
-        if isinstance(iterable, ChannelQsContext):
-            return ChannelQsContext(filterset.qs, iterable.channel_slug)
-
-        return filterset.qs
+    if filter_input:
+        return filter_func(
+            iterable, args, filterset_class, filter_input, request, allow_replica
+        )
 
     return iterable
 
 
-class NonNullConnection(Connection):
+def update_args_with_channel(args, root):
+    # for nested filters get channel from ChannelContext object
+    if "channel" not in args and root and hasattr(root, "channel_slug"):
+        args["channel"] = root.channel_slug
+
+
+def filter_qs(
+    iterable, args, filterset_class, filter_input, request, allow_replica=False
+):
+    try:
+        filter_channel = str(filter_input["channel"])
+    except (NoDefaultChannel, ChannelNotDefined, GraphQLError, KeyError):
+        filter_channel = None
+    filter_input["channel"] = (
+        args.get("channel")
+        or filter_channel
+        or get_default_channel_slug_or_graphql_error(allow_replica)
+    )
+
+    if currency := args.get("currency"):
+        filter_input["currency"] = currency
+
+    if isinstance(iterable, ChannelQsContext):
+        queryset = iterable.qs
+    else:
+        queryset = iterable
+
+    filterset = filterset_class(filter_input, queryset=queryset, request=request)
+    if not filterset.is_valid():
+        raise GraphQLError(json.dumps(filterset.errors.get_json_data()))
+
+    if isinstance(iterable, ChannelQsContext):
+        return ChannelQsContext(filterset.qs, iterable.channel_slug)
+
+    return filterset.qs
+
+
+def where_filter_qs(
+    iterable, args, filterset_class, filter_input, request, allow_replica=False
+):
+    """Filter queryset by complex statement provided in where argument.
+
+    Handle `AND`, `OR`, `NOT` operators, as well as flat filter input.
+    The returned queryset contains data that fulfill all specified statements.
+    The condition can be nested, the operators cannot be mixed in
+    a single filter object.
+    Multiple operators can be provided with use of nesting. See the example below.
+
+    E.g.
+    {
+        'where': {
+            'AND': [
+                {'input_type': {'one_of': ['rich-text', 'dropdown']}}
+                {
+                    'OR': [
+                        {'name': {'eq': 'Author'}},
+                        {'slug': {'one_of': ['a-rich', 'abv']}}
+                    ]
+                },
+                {
+                    'NOT': {'name': {'eq': 'ABV'}}
+                }
+            ],
+        }
+    }
+    For above example the returned instances will fulfill following conditions:
+        - it must be a type o 'rich-text'or 'dropdown'
+        - the name must equal to 'Author' or the slug must be equal to `a-rich` or `abv`
+        - the name cannot be equal to `ABV`
+    """
+    # when any operator appear there cannot be any more data in filter input
+    if contains_filter_operator(filter_input) and len(filter_input) > 1:
+        raise GraphQLError("Cannot mix operators with other filter inputs.")
+
+    and_filter_input = filter_input.pop("AND", None)
+    or_filter_input = filter_input.pop("OR", None)
+    # TODO: needs optimization
+    # not_filter_input = filter_input.pop("NOT", None)
+
+    if isinstance(iterable, ChannelQsContext):
+        queryset = iterable.qs
+    else:
+        queryset = iterable
+
+    if and_filter_input:
+        queryset = _handle_and_filter_input(
+            and_filter_input, queryset, args, filterset_class, request, allow_replica
+        )
+
+    if or_filter_input:
+        queryset = _handle_or_filter_input(
+            or_filter_input, queryset, args, filterset_class, request, allow_replica
+        )
+
+    # TODO: needs optimization
+    # if not_filter_input:
+    #     queryset = _handle_not_filter_input(
+    #         not_filter_input, queryset, args, filterset_class, request
+    #     )
+
+    if filter_input:
+        qs_to_combine = filter_qs(
+            iterable, args, filterset_class, filter_input, request, allow_replica
+        )
+        if isinstance(qs_to_combine, ChannelQsContext):
+            queryset &= qs_to_combine.qs
+
+        else:
+            queryset &= qs_to_combine
+
+    if isinstance(iterable, ChannelQsContext):
+        return ChannelQsContext(queryset, iterable.channel_slug)
+
+    return queryset
+
+
+def contains_filter_operator(input: dict[str, dict | str]):
+    return any(operator in input for operator in ["AND", "OR", "NOT"])
+
+
+def _handle_and_filter_input(
+    filter_input, queryset, args, filterset_class, request, allow_replica
+):
+    for input in filter_input:
+        if contains_filter_operator(input):
+            # when the input contains the operator run the where_filter_qs method again
+            # to properly handle the nested input
+            queryset &= where_filter_qs(
+                queryset, args, filterset_class, input, request, allow_replica
+            )
+        else:
+            queryset &= filter_qs(
+                queryset, args, filterset_class, input, request, allow_replica
+            )
+    return queryset
+
+
+def _handle_or_filter_input(
+    filter_input, queryset, args, filterset_class, request, allow_replica
+):
+    # for the OR operator the instanced that passed one of specified condition are
+    # found, then the return queryset is joined with the use of AND operator with
+    # main qs
+    qs = queryset.model.objects.none()
+    for input in filter_input:
+        if contains_filter_operator(input):
+            # when the input contains the operator run the where_filter_qs method again
+            # to properly handle the nested input
+            qs |= where_filter_qs(
+                queryset, args, filterset_class, input, request, allow_replica
+            )
+        else:
+            qs |= filter_qs(
+                queryset, args, filterset_class, input, request, allow_replica
+            )
+    queryset &= qs
+    return queryset
+
+
+def create_connection_slice_for_sync_webhook_control_context(
+    iterable, info: "ResolveInfo", args, connection_type, allow_sync_webhooks
+):
+    edges_with_context = []
+    sliced_connection = create_connection_slice(iterable, info, args, connection_type)
+
+    for edge in sliced_connection.edges:
+        node = edge.node
+        edge.node = SyncWebhookControlContext(
+            node=node, allow_sync_webhooks=allow_sync_webhooks
+        )
+        edges_with_context.append(edge)
+    sliced_connection.edges = edges_with_context
+    return sliced_connection
+
+
+# TODO: needs optimization
+# def _handle_not_filter_input(filter_input, queryset, args, filterset_class, request):
+#     if contains_filter_operator(filter_input):
+#         qs = where_filter_qs(queryset, args, filterset_class, filter_input, request)
+#     else:
+#         qs = filter_qs(queryset, args, filterset_class, filter_input, request)
+#     queryset = queryset.exclude(Exists(qs.filter(id=OuterRef("id"))))
+#     return queryset
+
+
+class NonNullConnection(BaseConnection):
     class Meta:
         abstract = True
 
@@ -447,12 +696,13 @@ class NonNullConnection(Connection):
         edge_name = cls.Edge._meta.name
         edge_bases = (EdgeBase, graphene.ObjectType)
         edge = type(edge_name, edge_bases, {})
+        edge.doc_category = options.get("doc_category")  # type: ignore[attr-defined]
         cls.Edge = edge
 
         # Override the `edges` field to make it non-null list
         # of non-null edges.
         cls._meta.fields["edges"] = graphene.Field(
-            graphene.NonNull(graphene.List(graphene.NonNull(cls.Edge)))
+            graphene.NonNull(NonNullList(cls.Edge))
         )
 
 
@@ -462,7 +712,8 @@ class CountableConnection(NonNullConnection):
 
     total_count = graphene.Int(description="A total count of items in the collection.")
 
-    def resolve_total_count(root, *_):
+    @staticmethod
+    def resolve_total_count(root, _info):
         try:
             if isinstance(root, dict):
                 total_count = root["total_count"]

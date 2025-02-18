@@ -1,7 +1,8 @@
 import json
 import logging
+from collections.abc import Callable
 from decimal import Decimal
-from typing import TYPE_CHECKING, Any, Callable, Dict, Optional
+from typing import TYPE_CHECKING, Any, Optional
 
 import Adyen
 import opentracing
@@ -11,11 +12,19 @@ from django.conf import settings
 from django_countries.fields import Country
 from requests.exceptions import ConnectTimeout
 
-from .....checkout.calculations import checkout_shipping_price, checkout_total
-from .....checkout.fetch import fetch_checkout_info, fetch_checkout_lines
+from .....checkout.calculations import (
+    checkout_line_unit_price,
+    checkout_shipping_price,
+    checkout_total,
+)
+from .....checkout.fetch import (
+    CheckoutInfo,
+    CheckoutLineInfo,
+    fetch_checkout_info,
+    fetch_checkout_lines,
+)
 from .....checkout.models import Checkout
-from .....checkout.utils import is_shipping_required
-from .....discount.utils import fetch_active_discounts
+from .....checkout.utils import get_checkout_metadata, is_shipping_required
 from .....payment.models import Payment
 from .....plugins.manager import get_plugins_manager
 from .... import PaymentError
@@ -32,7 +41,10 @@ logger = logging.getLogger(__name__)
 FAILED_STATUSES = ["refused", "error", "cancelled"]
 PENDING_STATUSES = ["pending", "received"]
 AUTH_STATUS = "authorised"
-HTTP_TIMEOUT = 20  # in seconds
+
+# we'd like shorter timeout than default 30s for Adyen client,
+# library doesn't allow to set connection establ. timeout
+HTTP_TIMEOUT = 20
 
 
 def initialize_adyen_client(config: GatewayConfig) -> Adyen.Adyen:
@@ -70,16 +82,16 @@ def get_tax_percentage_in_adyen_format(total_gross, total_net):
 
 
 def api_call(
-    request_data: Optional[Dict[str, Any]], method: Callable, **kwargs
+    request_data: dict[str, Any] | None, method: Callable, **kwargs
 ) -> Adyen.Adyen:
     try:
         return method(request_data, **kwargs)
     except (Adyen.AdyenError, ValueError, TypeError, ConnectTimeout) as e:
-        logger.warning(f"Unable to process the payment: {e}")
-        raise PaymentError(f"Unable to process the payment request: {e}.")
+        logger.warning("Unable to process the payment: %s", e)
+        raise PaymentError(f"Unable to process the payment request: {e}.") from e
 
 
-def prepare_address_request_data(address: Optional["AddressData"]) -> Optional[dict]:
+def prepare_address_request_data(address: Optional["AddressData"]) -> dict | None:
     """Create address structure for Adyen request.
 
     The sample recieved from Adyen team:
@@ -128,7 +140,7 @@ def request_data_for_payment(
     return_url: str,
     merchant_account: str,
     native_3d_secure: bool,
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     payment_data = payment_information.data or {}
 
     if not payment_data.pop("is_valid", True):
@@ -213,7 +225,7 @@ def request_data_for_payment(
     return request_data
 
 
-def get_shipping_data(manager, checkout_info, lines, discounts):
+def get_shipping_data(manager, checkout_info, lines):
     address = checkout_info.shipping_address or checkout_info.billing_address
     currency = checkout_info.checkout.currency
     shipping_total = checkout_shipping_price(
@@ -221,7 +233,6 @@ def get_shipping_data(manager, checkout_info, lines, discounts):
         checkout_info=checkout_info,
         lines=lines,
         address=address,
-        discounts=discounts,
     )
     total_gross = shipping_total.gross.amount
     total_net = shipping_total.net.amount
@@ -254,10 +265,9 @@ def append_checkout_details(payment_information: "PaymentData", payment_data: di
     if not checkout:
         raise PaymentError("Unable to calculate products for klarna.")
 
-    manager = get_plugins_manager()
+    manager = get_plugins_manager(allow_replica=False)
     lines, _ = fetch_checkout_lines(checkout)
-    discounts = fetch_active_discounts()
-    checkout_info = fetch_checkout_info(checkout, lines, discounts, manager)
+    checkout_info = fetch_checkout_info(checkout, lines, manager)
     currency = payment_information.currency
     country_code = checkout.get_country()
 
@@ -266,14 +276,12 @@ def append_checkout_details(payment_information: "PaymentData", payment_data: di
 
     line_items = []
     for line_info in lines:
-        address = checkout_info.shipping_address or checkout_info.billing_address
-        unit_price = manager.calculate_checkout_line_unit_price(
-            checkout_info,
-            lines,
-            line_info,
-            address,
-            discounts,
-        ).price_with_sale
+        unit_price = checkout_line_unit_price(
+            manager=manager,
+            checkout_info=checkout_info,
+            lines=lines,
+            checkout_line_info=line_info,
+        )
         unit_gross = unit_price.gross.amount
         unit_net = unit_price.net.amount
         tax_amount = unit_price.tax.amount
@@ -297,7 +305,7 @@ def append_checkout_details(payment_information: "PaymentData", payment_data: di
     if checkout_info.delivery_method_info.delivery_method and is_shipping_required(
         lines
     ):
-        line_items.append(get_shipping_data(manager, checkout_info, lines, discounts))
+        line_items.append(get_shipping_data(manager, checkout_info, lines))
 
     payment_data["lineItems"] = line_items
     return payment_data
@@ -329,19 +337,19 @@ def get_shopper_locale_value(country_code: str):
 
 
 def request_data_for_gateway_config(
-    checkout: "Checkout", merchant_account
-) -> Dict[str, Any]:
-    manager = get_plugins_manager()
-    address = checkout.billing_address or checkout.shipping_address
-    discounts = fetch_active_discounts()
-    lines, _ = fetch_checkout_lines(checkout)
-    checkout_info = fetch_checkout_info(checkout, lines, discounts, manager)
+    checkout_info: "CheckoutInfo",
+    lines: list[CheckoutLineInfo] | None,
+    merchant_account,
+) -> dict[str, Any]:
+    manager = get_plugins_manager(allow_replica=False)
+    checkout = checkout_info.checkout
+    address = checkout_info.shipping_address or checkout_info.billing_address
+    lines = lines or []
     total = checkout_total(
         manager=manager,
         checkout_info=checkout_info,
         lines=lines,
         address=address,
-        discounts=discounts,
     )
 
     country = address.country if address else None
@@ -349,7 +357,12 @@ def request_data_for_gateway_config(
         country_code = country.code
     else:
         country_code = Country(settings.DEFAULT_COUNTRY).code
-    channel = checkout.get_value_from_metadata("channel", "web")
+    checkout_metadata = get_checkout_metadata(checkout)
+    if checkout_metadata:
+        channel = checkout_metadata.get_value_from_metadata("channel", "web")
+    else:
+        channel = "web"
+
     return {
         "merchantAccount": merchant_account,
         "countryCode": country_code,
@@ -367,7 +380,7 @@ def request_for_payment_refund(
     graphql_payment_id: str,
     merchant_account: str,
     token: str,
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     return {
         "merchantAccount": merchant_account,
         "modificationAmount": {
@@ -381,7 +394,7 @@ def request_for_payment_refund(
 
 def request_for_payment_capture(
     payment_information: "PaymentData", merchant_account: str, token: str
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     return {
         "merchantAccount": merchant_account,
         "modificationAmount": {
@@ -492,7 +505,7 @@ def get_request_data_for_check_payment(data: dict, merchant_account: str) -> dic
     amount_input = data["card"].get("money")
     security_code = data["card"].get("cvc")
 
-    request_data = {
+    request_data: dict[str, Any] = {
         "merchantAccount": merchant_account,
         "paymentMethod": {
             "type": data["method"],
@@ -509,6 +522,6 @@ def get_request_data_for_check_payment(data: dict, merchant_account: str) -> dic
         }
 
     if security_code:
-        request_data["paymentMethod"]["securityCode"] = security_code  # type: ignore
+        request_data["paymentMethod"]["securityCode"] = security_code
 
     return request_data

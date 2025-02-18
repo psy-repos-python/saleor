@@ -31,7 +31,6 @@ def parse_description_json_field(apps, schema):
 
 
 class Migration(migrations.Migration):
-
     dependencies = [
         ("product", "0148_producttype_product_type_search_gin"),
     ]
@@ -42,6 +41,7 @@ class Migration(migrations.Migration):
             name="description_plaintext",
             field=models.TextField(blank=True),
         ),
+        # nosemgrep: add-index-concurrently
         migrations.AddIndex(
             model_name="category",
             index=django.contrib.postgres.indexes.GinIndex(

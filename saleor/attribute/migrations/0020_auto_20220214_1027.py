@@ -92,7 +92,7 @@ def queryset_in_batches(queryset):
     start_pk = 0
 
     while True:
-        qs = queryset.filter(pk__gt=start_pk)[:2000]
+        qs = queryset.order_by("pk").filter(pk__gt=start_pk)[:2000]
         pks = list(qs.values_list("pk", flat=True))
 
         if not pks:
@@ -104,7 +104,6 @@ def queryset_in_batches(queryset):
 
 
 class Migration(migrations.Migration):
-
     dependencies = [
         ("attribute", "0019_auto_20220214_1025"),
     ]

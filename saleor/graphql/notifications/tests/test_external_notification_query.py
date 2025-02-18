@@ -5,7 +5,7 @@ import pytest
 from graphql_relay.node.node import to_global_id
 
 from ....account.models import User
-from ....core.notify_events import UserNotifyEvent
+from ....core.notify import UserNotifyEvent
 from ....graphql.tests.utils import assert_no_permission
 from ....plugins.tests.sample_plugins import PluginSample
 
@@ -32,7 +32,7 @@ query_test_invalid_data = [
         },
         400,
         'Variable "$input" got invalid value {"externalEventType": {},'
-        ' "extraPayload": "\\"{}\\""}.\nIn field "ids": Expected "[ID]!", found null.',
+        ' "extraPayload": "\\"{}\\""}.\nIn field "ids": Expected "[ID!]!", found null.',
     ),
     (
         {
@@ -49,7 +49,9 @@ query_test_invalid_data = [
 ]
 
 
-@pytest.mark.parametrize("variables, status_code, message", query_test_invalid_data)
+@pytest.mark.parametrize(
+    ("variables", "status_code", "message"), query_test_invalid_data
+)
 def test_external_notification_trigger_query_with_invalid_data(
     variables,
     status_code,
@@ -82,7 +84,6 @@ def test_notify_via_external_notification_trigger_for_plugin_manager(
     permission_manage_users,
     channel_PLN,
 ):
-
     settings.PLUGINS = ["saleor.plugins.tests.sample_plugins.PluginSample"]
 
     variables = {
@@ -113,7 +114,6 @@ def test_notify_via_external_notification_trigger_without_permission(
     staff_api_client,
     channel_PLN,
 ):
-
     variables = {
         "input": {
             "ids": [to_global_id(User.__name__, user.id) for user in staff_users],

@@ -2,35 +2,49 @@ from decimal import Decimal
 from functools import partial
 from unittest import mock
 
+import graphene
+from django.core.files import File
 from measurement.measures import Weight
 from prices import Money, fixed_discount
 
-from ...core.notify_events import NotifyEventType
+from ...attribute.tests.model_helpers import (
+    get_product_attribute_values,
+    get_product_attributes,
+)
+from ...core.notify import NotifyEventType
 from ...core.prices import quantize_price
+from ...core.tests.utils import get_site_context_payload
 from ...discount import DiscountValueType
+from ...graphql.core.utils import to_global_id_or_none
+from ...graphql.order.utils import OrderLineData
 from ...order import notifications
 from ...order.fetch import fetch_order_info
+from ...payment.model_helpers import get_subtotal
 from ...plugins.manager import get_plugins_manager
 from ...product.models import DigitalContentUrl
+from ...thumbnail import THUMBNAIL_SIZES
+from ...thumbnail.models import Thumbnail
 from ..notifications import (
     get_address_payload,
+    get_attribute_data_from_order_lines,
     get_custom_order_payload,
     get_default_fulfillment_line_payload,
     get_default_fulfillment_payload,
+    get_default_images_payload,
     get_default_order_payload,
     get_order_line_payload,
 )
 from ..utils import add_variant_to_order
 
 
-def test_get_custom_order_payload(order):
+def test_get_custom_order_payload(order, site_settings):
     expected_payload = get_custom_order_payload(order)
     assert expected_payload == {
         "order": {
-            "id": expected_payload["order"]["id"],
-            "number": expected_payload["order"]["id"],
+            "id": to_global_id_or_none(order),
+            "number": order.number,
             "private_metadata": {},
-            "metadata": {},
+            "metadata": order.metadata,
             "status": "unfulfilled",
             "language_code": "en",
             "currency": "USD",
@@ -83,26 +97,30 @@ def test_get_custom_order_payload(order):
             "discount_amount": 0,
         },
         "recipient_email": "test@example.com",
-        "domain": "mirumee.com",
-        "site_name": "mirumee.com",
+        **get_site_context_payload(site_settings.site),
     }
 
 
 def test_get_order_line_payload(order_line):
-    order_line.variant.product.weight = Weight(kg=5)
-    order_line.variant.product.save()
+    # given
+    product = order_line.variant.product
+    product.weight = Weight(kg=5)
+    product.save()
+    attribute_data = get_attribute_data_from_order_lines([order_line])
 
-    payload = get_order_line_payload(order_line)
+    # when
+    payload = get_order_line_payload(order_line, attribute_data)
 
-    attributes = order_line.variant.product.attributes.all()
+    # then
+    attributes = get_product_attributes(product)
     expected_attributes_payload = []
     for attr in attributes:
         expected_attributes_payload.append(
             {
                 "assignment": {
                     "attribute": {
-                        "slug": attr.assignment.attribute.slug,
-                        "name": attr.assignment.attribute.name,
+                        "slug": attr.slug,
+                        "name": attr.name,
                     }
                 },
                 "values": [
@@ -112,7 +130,7 @@ def test_get_order_line_payload(order_line):
                         "slug": value.slug,
                         "file_url": value.file_url,
                     }
-                    for value in attr.values.all()
+                    for value in get_product_attribute_values(product, attr)
                 ],
             }
         )
@@ -125,7 +143,7 @@ def test_get_order_line_payload(order_line):
     currency = order_line.currency
     assert payload == {
         "variant": {
-            "id": order_line.variant_id,
+            "id": to_global_id_or_none(order_line.variant),
             "first_image": None,
             "images": None,
             "weight": "",
@@ -138,17 +156,17 @@ def test_get_order_line_payload(order_line):
             "first_image": None,
             "images": None,
             "weight": "5.0 kg",
-            "id": order_line.variant.product.id,
+            "id": to_global_id_or_none(order_line.variant.product),
         },
         "translated_product_name": order_line.translated_product_name
         or order_line.product_name,
         "translated_variant_name": order_line.translated_variant_name
         or order_line.variant_name,
-        "id": order_line.id,
+        "id": to_global_id_or_none(order_line),
         "product_name": order_line.product_name,
         "variant_name": order_line.variant_name,
         "product_sku": order_line.product_sku,
-        "product_variant_id": order_line.product_variant_id,
+        "product_variant_id": to_global_id_or_none(order_line.variant),
         "is_shipping_required": order_line.is_shipping_required,
         "quantity": order_line.quantity,
         "quantity_fulfilled": order_line.quantity_fulfilled,
@@ -165,18 +183,24 @@ def test_get_order_line_payload(order_line):
         "total_tax_amount": quantize_price(total_tax.amount, currency),
         "tax_rate": order_line.tax_rate,
         "is_digital": order_line.is_digital,
-        "digital_url": "",
+        "digital_url": None,
         "unit_discount_amount": order_line.unit_discount_amount,
         "unit_discount_reason": order_line.unit_discount_reason,
         "unit_discount_type": order_line.unit_discount_type,
         "unit_discount_value": order_line.unit_discount_value,
+        "metadata": order_line.metadata,
     }
 
 
 def test_get_order_line_payload_deleted_variant(order_line):
+    # given
     order_line.variant = None
-    payload = get_order_line_payload(order_line)
+    attribute_data = get_attribute_data_from_order_lines([order_line])
 
+    # when
+    payload = get_order_line_payload(order_line, attribute_data)
+
+    # then
     assert payload["variant"] is None
     assert payload["product"] is None
 
@@ -199,11 +223,14 @@ def test_get_address_payload(address):
 
 
 def test_get_default_order_payload(order_line):
+    # given
     order_line.refresh_from_db()
     order = order_line.order
-    order_line_payload = get_order_line_payload(order_line)
+    attribute_data = get_attribute_data_from_order_lines(order.lines.all())
+    order.subtotal = get_subtotal(order.lines.all(), order.currency)
+    order_line_payload = get_order_line_payload(order_line, attribute_data)
     redirect_url = "http://redirect.com/path"
-    subtotal = order.get_subtotal()
+    subtotal = order.subtotal
     order.total = subtotal + order.shipping_price
     tax = order.total_gross_amount - order.total_net_amount
 
@@ -216,12 +243,13 @@ def test_get_default_order_payload(order_line):
         value=value,
         reason="Discount reason",
         amount=(order.undiscounted_total - order.total).gross,
-        # type: ignore
     )
     order.save()
 
+    # when
     payload = get_default_order_payload(order, redirect_url)
 
+    # then
     assert payload == {
         "discounts": [
             {
@@ -235,10 +263,10 @@ def test_get_default_order_payload(order_line):
             }
         ],
         "channel_slug": order.channel.slug,
-        "id": order.id,
-        "number": order.id,
-        "token": order.token,
-        "created": str(order.created),
+        "id": to_global_id_or_none(order),
+        "number": order.number,
+        "token": order.id,
+        "created": str(order.created_at),
         "display_gross_prices": order.display_gross_prices,
         "currency": order.currency,
         "total_gross_amount": order.total_gross_amount,
@@ -247,10 +275,10 @@ def test_get_default_order_payload(order_line):
         "collection_point_name": order.collection_point_name,
         "status": order.status,
         "metadata": order.metadata,
-        "private_metadata": order.private_metadata,
+        "private_metadata": {},
         "shipping_price_net_amount": order.shipping_price_net_amount,
         "shipping_price_gross_amount": order.shipping_price_gross_amount,
-        "order_details_url": f"{redirect_url}?token={order.token}",
+        "order_details_url": f"{redirect_url}?token={order.id}",
         "email": order.get_customer_email(),
         "subtotal_gross_amount": subtotal.gross.amount,
         "subtotal_net_amount": subtotal.net.amount,
@@ -266,10 +294,8 @@ def test_get_default_order_payload(order_line):
     }
 
 
-def test_get_default_fulfillment_payload(
-    fulfillment,
-    digital_content,
-):
+def test_get_default_fulfillment_payload(fulfillment, digital_content, site_settings):
+    # given
     order = fulfillment.order
     fulfillment.tracking_number = "http://tracking.url.com/123"
     fulfillment.save(update_fields=["tracking_number"])
@@ -277,14 +303,22 @@ def test_get_default_fulfillment_payload(
     line.variant = digital_content.product_variant
     line.save(update_fields=["variant"])
     DigitalContentUrl.objects.create(content=digital_content, line=line)
+    attribute_data = get_attribute_data_from_order_lines(order.lines.all())
 
     order_payload = get_default_order_payload(order)
+
+    # when
     payload = get_default_fulfillment_payload(order, fulfillment)
 
+    # then
     # make sure that test will not fail because of the list order
-    payload["order"]["lines"] = sorted(payload["order"]["lines"], key=lambda l: l["id"])
-    payload["physical_lines"] = sorted(payload["physical_lines"], key=lambda l: l["id"])
-    order_payload["lines"] = sorted(order_payload["lines"], key=lambda l: l["id"])
+    payload["order"]["lines"] = sorted(
+        payload["order"]["lines"], key=lambda line: line["id"]
+    )
+    payload["physical_lines"] = sorted(
+        payload["physical_lines"], key=lambda line: line["id"]
+    )
+    order_payload["lines"] = sorted(order_payload["lines"], key=lambda line: line["id"])
 
     digital_line = fulfillment.lines.get(order_line=line.id)
     physical_line = fulfillment.lines.exclude(id=digital_line.id).first()
@@ -294,83 +328,104 @@ def test_get_default_fulfillment_payload(
             "tracking_number": fulfillment.tracking_number,
             "is_tracking_number_url": fulfillment.is_tracking_number_url,
         },
-        "physical_lines": [get_default_fulfillment_line_payload(physical_line)],
-        "digital_lines": [get_default_fulfillment_line_payload(digital_line)],
+        "physical_lines": [
+            get_default_fulfillment_line_payload(physical_line, attribute_data)
+        ],
+        "digital_lines": [
+            get_default_fulfillment_line_payload(digital_line, attribute_data)
+        ],
         "recipient_email": order.get_customer_email(),
-        "site_name": "mirumee.com",
-        "domain": "mirumee.com",
+        **get_site_context_payload(site_settings.site),
     }
 
 
 @mock.patch("saleor.plugins.manager.PluginsManager.notify")
 def test_send_email_payment_confirmation(mocked_notify, site_settings, payment_dummy):
-    manager = get_plugins_manager()
+    # given
+    manager = get_plugins_manager(allow_replica=False)
     order = payment_dummy.order
     order_info = fetch_order_info(order)
     expected_payload = {
         "order": get_default_order_payload(order),
         "recipient_email": order.get_customer_email(),
         "payment": {
-            "created": payment_dummy.created,
-            "modified": payment_dummy.modified,
+            "created": payment_dummy.created_at,
+            "modified": payment_dummy.modified_at,
             "charge_status": payment_dummy.charge_status,
             "total": payment_dummy.total,
             "captured_amount": payment_dummy.captured_amount,
             "currency": payment_dummy.currency,
         },
-        "site_name": "mirumee.com",
-        "domain": "mirumee.com",
+        **get_site_context_payload(site_settings.site),
     }
+
+    # when
     notifications.send_payment_confirmation(order_info, manager)
-    mocked_notify.assert_called_once_with(
-        NotifyEventType.ORDER_PAYMENT_CONFIRMATION,
-        expected_payload,
-        channel_slug=order.channel.slug,
-    )
+
+    # then
+    assert mocked_notify.call_count == 1
+    call_args = mocked_notify.call_args_list[0]
+    called_args = call_args.args
+    called_kwargs = call_args.kwargs
+    assert called_args[0] == NotifyEventType.ORDER_PAYMENT_CONFIRMATION
+    assert len(called_kwargs) == 2
+    assert called_kwargs["payload_func"]() == expected_payload
+    assert called_kwargs["channel_slug"] == order.channel.slug
 
 
 @mock.patch("saleor.plugins.manager.PluginsManager.notify")
 def test_send_email_order_confirmation(mocked_notify, order, site_settings):
-    manager = get_plugins_manager()
+    # given
+    manager = get_plugins_manager(allow_replica=False)
     redirect_url = "https://www.example.com"
     order_info = fetch_order_info(order)
 
+    # when
     notifications.send_order_confirmation(order_info, redirect_url, manager)
 
+    # then
     expected_payload = {
         "order": get_default_order_payload(order, redirect_url),
         "recipient_email": order.get_customer_email(),
-        "site_name": "mirumee.com",
-        "domain": "mirumee.com",
+        **get_site_context_payload(site_settings.site),
     }
-    mocked_notify.assert_called_once_with(
-        NotifyEventType.ORDER_CONFIRMATION,
-        expected_payload,
-        channel_slug=order.channel.slug,
-    )
+    assert mocked_notify.call_count == 1
+    call_args = mocked_notify.call_args_list[0]
+    called_args = call_args.args
+    called_kwargs = call_args.kwargs
+    assert called_args[0] == NotifyEventType.ORDER_CONFIRMATION
+    assert len(called_kwargs) == 2
+    assert called_kwargs["payload_func"]() == expected_payload
+    assert called_kwargs["channel_slug"] == order.channel.slug
 
 
 @mock.patch("saleor.plugins.manager.PluginsManager.notify")
 def test_send_email_order_confirmation_for_cc(
     mocked_notify, order_with_lines_for_cc, site_settings, warehouse_for_cc
 ):
-    manager = get_plugins_manager()
+    # given
+    manager = get_plugins_manager(allow_replica=False)
     redirect_url = "https://www.example.com"
     order_info = fetch_order_info(order_with_lines_for_cc)
 
+    # when
     notifications.send_order_confirmation(order_info, redirect_url, manager)
 
+    # then
     expected_payload = {
         "order": get_default_order_payload(order_with_lines_for_cc, redirect_url),
         "recipient_email": order_with_lines_for_cc.get_customer_email(),
-        "site_name": "mirumee.com",
-        "domain": "mirumee.com",
+        **get_site_context_payload(site_settings.site),
     }
-    mocked_notify.assert_called_once_with(
-        NotifyEventType.ORDER_CONFIRMATION,
-        expected_payload,
-        channel_slug=order_with_lines_for_cc.channel.slug,
-    )
+    assert mocked_notify.call_count == 1
+    call_args = mocked_notify.call_args_list[0]
+    called_args = call_args.args
+    called_kwargs = call_args.kwargs
+    assert called_args[0] == NotifyEventType.ORDER_CONFIRMATION
+    assert len(called_kwargs) == 2
+    assert called_kwargs["payload_func"]() == expected_payload
+    assert called_kwargs["channel_slug"] == order_with_lines_for_cc.channel.slug
+
     assert expected_payload["order"]["collection_point_name"] == warehouse_for_cc.name
 
 
@@ -378,20 +433,24 @@ def test_send_email_order_confirmation_for_cc(
 def test_send_confirmation_emails_without_addresses_for_payment(
     mocked_notify,
     site_settings,
-    info,
+    anonymous_plugins,
     digital_content,
     payment_dummy,
 ):
+    # given
     order = payment_dummy.order
+    line_data = OrderLineData(
+        variant_id=str(digital_content.product_variant.id),
+        variant=digital_content.product_variant,
+        quantity=1,
+    )
 
     line = add_variant_to_order(
-        order,
-        digital_content.product_variant,
-        quantity=1,
-        user=info.context.user,
-        app=info.context.app,
-        manager=info.context.plugins,
-        site_settings=site_settings,
+        order=order,
+        line_data=line_data,
+        user=None,
+        app=None,
+        manager=anonymous_plugins,
     )
     DigitalContentUrl.objects.create(content=digital_content, line=line)
 
@@ -401,44 +460,55 @@ def test_send_confirmation_emails_without_addresses_for_payment(
     order.save(update_fields=["shipping_address", "shipping_method", "billing_address"])
     order_info = fetch_order_info(order)
 
-    notifications.send_payment_confirmation(order_info, info.context.plugins)
+    # when
+    notifications.send_payment_confirmation(order_info, anonymous_plugins)
 
+    # then
     expected_payload = {
         "order": get_default_order_payload(order),
         "recipient_email": order.get_customer_email(),
         "payment": {
-            "created": payment_dummy.created,
-            "modified": payment_dummy.modified,
+            "created": payment_dummy.created_at,
+            "modified": payment_dummy.modified_at,
             "charge_status": payment_dummy.charge_status,
             "total": payment_dummy.total,
             "captured_amount": payment_dummy.captured_amount,
             "currency": payment_dummy.currency,
         },
-        "site_name": "mirumee.com",
-        "domain": "mirumee.com",
+        **get_site_context_payload(site_settings.site),
     }
-    mocked_notify.assert_called_once_with(
-        NotifyEventType.ORDER_PAYMENT_CONFIRMATION,
-        expected_payload,
-        channel_slug=order.channel.slug,
-    )
+    assert mocked_notify.call_count == 1
+    call_args = mocked_notify.call_args_list[0]
+    called_args = call_args.args
+    called_kwargs = call_args.kwargs
+    assert called_args[0] == NotifyEventType.ORDER_PAYMENT_CONFIRMATION
+    assert len(called_kwargs) == 2
+    assert called_kwargs["payload_func"]() == expected_payload
+    assert called_kwargs["channel_slug"] == order.channel.slug
 
 
 @mock.patch("saleor.plugins.manager.PluginsManager.notify")
 def test_send_confirmation_emails_without_addresses_for_order(
-    mocked_notify, order, site_settings, digital_content, info
+    mocked_notify,
+    order,
+    site_settings,
+    digital_content,
+    anonymous_plugins,
 ):
-
+    # given
     assert not order.lines.count()
+    line_data = OrderLineData(
+        variant_id=str(digital_content.product_variant.id),
+        variant=digital_content.product_variant,
+        quantity=1,
+    )
 
     line = add_variant_to_order(
-        order,
-        digital_content.product_variant,
-        quantity=1,
-        user=info.context.user,
-        app=info.context.app,
-        manager=info.context.plugins,
-        site_settings=site_settings,
+        order=order,
+        line_data=line_data,
+        user=None,
+        app=None,
+        manager=anonymous_plugins,
     )
     DigitalContentUrl.objects.create(content=digital_content, line=line)
 
@@ -450,33 +520,36 @@ def test_send_confirmation_emails_without_addresses_for_order(
 
     redirect_url = "https://www.example.com"
 
-    notifications.send_order_confirmation(
-        order_info, redirect_url, info.context.plugins
-    )
+    # when
+    notifications.send_order_confirmation(order_info, redirect_url, anonymous_plugins)
 
+    # then
     expected_payload = {
         "order": get_default_order_payload(order, redirect_url),
         "recipient_email": order.get_customer_email(),
-        "site_name": "mirumee.com",
-        "domain": "mirumee.com",
+        **get_site_context_payload(site_settings.site),
     }
-
-    mocked_notify.assert_called_once_with(
-        NotifyEventType.ORDER_CONFIRMATION,
-        expected_payload,
-        channel_slug=order.channel.slug,
-    )
+    assert mocked_notify.call_count == 1
+    call_args = mocked_notify.call_args_list[0]
+    called_args = call_args.args
+    called_kwargs = call_args.kwargs
+    assert called_args[0] == NotifyEventType.ORDER_CONFIRMATION
+    assert len(called_kwargs) == 2
+    assert called_kwargs["payload_func"]() == expected_payload
+    assert called_kwargs["channel_slug"] == order.channel.slug
 
 
 @mock.patch("saleor.plugins.manager.PluginsManager.notify")
 def test_send_fulfillment_confirmation_by_user(
     mocked_notify, fulfilled_order, site_settings, staff_user
 ):
+    # given
     fulfillment = fulfilled_order.fulfillments.first()
     fulfillment.tracking_number = "https://www.example.com"
     fulfillment.save()
-    manager = get_plugins_manager()
+    manager = get_plugins_manager(allow_replica=False)
 
+    # when
     notifications.send_fulfillment_confirmation_to_customer(
         order=fulfilled_order,
         fulfillment=fulfillment,
@@ -485,25 +558,31 @@ def test_send_fulfillment_confirmation_by_user(
         manager=manager,
     )
 
+    # then
     expected_payload = get_default_fulfillment_payload(fulfilled_order, fulfillment)
-    expected_payload["requester_user_id"] = staff_user.id
+    expected_payload["requester_user_id"] = to_global_id_or_none(staff_user)
     expected_payload["requester_app_id"] = None
-    mocked_notify.assert_called_once_with(
-        NotifyEventType.ORDER_FULFILLMENT_CONFIRMATION,
-        payload=expected_payload,
-        channel_slug=fulfilled_order.channel.slug,
-    )
+    assert mocked_notify.call_count == 1
+    call_args = mocked_notify.call_args_list[0]
+    called_args = call_args.args
+    called_kwargs = call_args.kwargs
+    assert called_args[0] == NotifyEventType.ORDER_FULFILLMENT_CONFIRMATION
+    assert len(called_kwargs) == 2
+    assert called_kwargs["payload_func"]() == expected_payload
+    assert called_kwargs["channel_slug"] == fulfilled_order.channel.slug
 
 
 @mock.patch("saleor.plugins.manager.PluginsManager.notify")
 def test_send_fulfillment_confirmation_by_app(
     mocked_notify, fulfilled_order, site_settings, app
 ):
+    # given
     fulfillment = fulfilled_order.fulfillments.first()
     fulfillment.tracking_number = "https://www.example.com"
     fulfillment.save()
-    manager = get_plugins_manager()
+    manager = get_plugins_manager(allow_replica=False)
 
+    # when
     notifications.send_fulfillment_confirmation_to_customer(
         order=fulfilled_order,
         fulfillment=fulfillment,
@@ -512,34 +591,45 @@ def test_send_fulfillment_confirmation_by_app(
         manager=manager,
     )
 
+    # then
     expected_payload = get_default_fulfillment_payload(fulfilled_order, fulfillment)
     expected_payload["requester_user_id"] = None
-    expected_payload["requester_app_id"] = app.id
-    mocked_notify.assert_called_once_with(
-        NotifyEventType.ORDER_FULFILLMENT_CONFIRMATION,
-        payload=expected_payload,
-        channel_slug=fulfilled_order.channel.slug,
-    )
+    expected_payload["requester_app_id"] = to_global_id_or_none(app)
+
+    assert mocked_notify.call_count == 1
+    call_args = mocked_notify.call_args_list[0]
+    called_args = call_args.args
+    called_kwargs = call_args.kwargs
+    assert called_args[0] == NotifyEventType.ORDER_FULFILLMENT_CONFIRMATION
+    assert len(called_kwargs) == 2
+    assert called_kwargs["payload_func"]() == expected_payload
+    assert called_kwargs["channel_slug"] == fulfilled_order.channel.slug
 
 
 @mock.patch("saleor.plugins.manager.PluginsManager.notify")
 def test_send_fulfillment_update(mocked_notify, fulfilled_order, site_settings):
+    # given
     fulfillment = fulfilled_order.fulfillments.first()
     fulfillment.tracking_number = "https://www.example.com"
     fulfillment.save()
-    manager = get_plugins_manager()
+    manager = get_plugins_manager(allow_replica=False)
 
+    # when
     notifications.send_fulfillment_update(
         order=fulfilled_order, fulfillment=fulfillment, manager=manager
     )
 
+    # then
     expected_payload = get_default_fulfillment_payload(fulfilled_order, fulfillment)
 
-    mocked_notify.assert_called_once_with(
-        NotifyEventType.ORDER_FULFILLMENT_UPDATE,
-        expected_payload,
-        channel_slug=fulfilled_order.channel.slug,
-    )
+    assert mocked_notify.call_count == 1
+    call_args = mocked_notify.call_args_list[0]
+    called_args = call_args.args
+    called_kwargs = call_args.kwargs
+    assert called_args[0] == NotifyEventType.ORDER_FULFILLMENT_UPDATE
+    assert len(called_kwargs) == 2
+    assert called_kwargs["payload_func"]() == expected_payload
+    assert called_kwargs["channel_slug"] == fulfilled_order.channel.slug
 
 
 @mock.patch("saleor.plugins.manager.PluginsManager.notify")
@@ -547,7 +637,7 @@ def test_send_email_order_canceled_by_user(
     mocked_notify, order, site_settings, staff_user
 ):
     # given
-    manager = get_plugins_manager()
+    manager = get_plugins_manager(allow_replica=False)
 
     # when
     notifications.send_order_canceled_confirmation(order, staff_user, None, manager)
@@ -556,22 +646,25 @@ def test_send_email_order_canceled_by_user(
     expected_payload = {
         "order": get_default_order_payload(order),
         "recipient_email": order.get_customer_email(),
-        "site_name": "mirumee.com",
-        "domain": "mirumee.com",
-        "requester_user_id": staff_user.id,
+        "requester_user_id": to_global_id_or_none(staff_user),
         "requester_app_id": None,
+        **get_site_context_payload(site_settings.site),
     }
-    mocked_notify.assert_called_once_with(
-        NotifyEventType.ORDER_CANCELED,
-        expected_payload,
-        channel_slug=order.channel.slug,
-    )
+
+    assert mocked_notify.call_count == 1
+    call_args = mocked_notify.call_args_list[0]
+    called_args = call_args.args
+    called_kwargs = call_args.kwargs
+    assert called_args[0] == NotifyEventType.ORDER_CANCELED
+    assert len(called_kwargs) == 2
+    assert called_kwargs["payload_func"]() == expected_payload
+    assert called_kwargs["channel_slug"] == order.channel.slug
 
 
 @mock.patch("saleor.plugins.manager.PluginsManager.notify")
 def test_send_email_order_canceled_by_app(mocked_notify, order, site_settings, app):
     # given
-    manager = get_plugins_manager()
+    manager = get_plugins_manager(allow_replica=False)
 
     # when
     notifications.send_order_canceled_confirmation(order, None, app, manager)
@@ -580,16 +673,18 @@ def test_send_email_order_canceled_by_app(mocked_notify, order, site_settings, a
     expected_payload = {
         "order": get_default_order_payload(order),
         "recipient_email": order.get_customer_email(),
-        "site_name": "mirumee.com",
-        "domain": "mirumee.com",
         "requester_user_id": None,
-        "requester_app_id": app.id,
+        "requester_app_id": to_global_id_or_none(app),
+        **get_site_context_payload(site_settings.site),
     }
-    mocked_notify.assert_called_once_with(
-        NotifyEventType.ORDER_CANCELED,
-        expected_payload,
-        channel_slug=order.channel.slug,
-    )
+    assert mocked_notify.call_count == 1
+    call_args = mocked_notify.call_args_list[0]
+    called_args = call_args.args
+    called_kwargs = call_args.kwargs
+    assert called_args[0] == NotifyEventType.ORDER_CANCELED
+    assert len(called_kwargs) == 2
+    assert called_kwargs["payload_func"]() == expected_payload
+    assert called_kwargs["channel_slug"] == order.channel.slug
 
 
 @mock.patch("saleor.plugins.manager.PluginsManager.notify")
@@ -597,7 +692,7 @@ def test_send_email_order_refunded_by_user(
     mocked_notify, order, site_settings, staff_user
 ):
     # given
-    manager = get_plugins_manager()
+    manager = get_plugins_manager(allow_replica=False)
     amount = order.total.gross.amount
 
     # when
@@ -607,27 +702,29 @@ def test_send_email_order_refunded_by_user(
 
     # then
     expected_payload = {
-        "requester_user_id": staff_user.id,
+        "requester_user_id": to_global_id_or_none(staff_user),
         "requester_app_id": None,
         "order": get_default_order_payload(order),
         "amount": amount,
         "currency": order.currency,
         "recipient_email": order.get_customer_email(),
-        "site_name": "mirumee.com",
-        "domain": "mirumee.com",
+        **get_site_context_payload(site_settings.site),
     }
 
-    mocked_notify.assert_called_once_with(
-        NotifyEventType.ORDER_REFUND_CONFIRMATION,
-        expected_payload,
-        channel_slug=order.channel.slug,
-    )
+    assert mocked_notify.call_count == 1
+    call_args = mocked_notify.call_args_list[0]
+    called_args = call_args.args
+    called_kwargs = call_args.kwargs
+    assert called_args[0] == NotifyEventType.ORDER_REFUND_CONFIRMATION
+    assert len(called_kwargs) == 2
+    assert called_kwargs["payload_func"]() == expected_payload
+    assert called_kwargs["channel_slug"] == order.channel.slug
 
 
 @mock.patch("saleor.plugins.manager.PluginsManager.notify")
 def test_send_email_order_refunded_by_app(mocked_notify, order, site_settings, app):
     # given
-    manager = get_plugins_manager()
+    manager = get_plugins_manager(allow_replica=False)
     amount = order.total.gross.amount
 
     # when
@@ -638,17 +735,43 @@ def test_send_email_order_refunded_by_app(mocked_notify, order, site_settings, a
     # then
     expected_payload = {
         "requester_user_id": None,
-        "requester_app_id": app.id,
+        "requester_app_id": to_global_id_or_none(app),
         "order": get_default_order_payload(order),
         "amount": amount,
         "currency": order.currency,
         "recipient_email": order.get_customer_email(),
-        "site_name": "mirumee.com",
-        "domain": "mirumee.com",
+        **get_site_context_payload(site_settings.site),
     }
 
-    mocked_notify.assert_called_once_with(
-        NotifyEventType.ORDER_REFUND_CONFIRMATION,
-        expected_payload,
-        channel_slug=order.channel.slug,
-    )
+    assert mocked_notify.call_count == 1
+    call_args = mocked_notify.call_args_list[0]
+    called_args = call_args.args
+    called_kwargs = call_args.kwargs
+    assert called_args[0] == NotifyEventType.ORDER_REFUND_CONFIRMATION
+    assert len(called_kwargs) == 2
+    assert called_kwargs["payload_func"]() == expected_payload
+    assert called_kwargs["channel_slug"] == order.channel.slug
+
+
+def test_get_default_images_payload(product_with_image):
+    # given
+    size = 128
+
+    thumbnail_mock = mock.MagicMock(spec=File)
+    thumbnail_mock.name = "thumbnail_image.jpg"
+
+    media = product_with_image.media.first()
+    Thumbnail.objects.create(product_media=media, image=thumbnail_mock, size=size)
+
+    media_id = graphene.Node.to_global_id("ProductMedia", media.id)
+
+    # when
+    payload = get_default_images_payload([media])
+
+    # then
+    images_payload = payload["first_image"]["original"]
+    for th_size in THUMBNAIL_SIZES:
+        assert (
+            images_payload[str(th_size)]
+            == f"http://mirumee.com/thumbnail/{media_id}/{th_size}/"
+        )

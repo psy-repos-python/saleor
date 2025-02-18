@@ -3,6 +3,8 @@ import pytest
 from freezegun import freeze_time
 
 from .....app.models import App
+from .....app.types import AppType
+from .....core.jwt import create_access_token_for_app
 from .....webhook.models import Webhook
 from ....tests.utils import assert_no_permission, get_graphql_content
 from ...enums import AppTypeEnum
@@ -33,6 +35,8 @@ QUERY_APPS_WITH_FILTER = """
                     supportUrl
                     configurationUrl
                     appUrl
+                    metafield(key: "test")
+                    metafields(keys: ["test"])
                     extensions{
                         id
                         label
@@ -47,18 +51,18 @@ QUERY_APPS_WITH_FILTER = """
             }
         }
     }
-    """
+"""
 
 
 @pytest.mark.parametrize(
-    "app_filter, count",
-    (
+    ("app_filter", "count"),
+    [
         ({"search": "Sample"}, 1),
         ({"isActive": False}, 1),
         ({}, 2),
         ({"type": AppTypeEnum.THIRDPARTY.name}, 1),
         ({"type": AppTypeEnum.LOCAL.name}, 1),
-    ),
+    ],
 )
 def test_apps_query(
     staff_api_client,
@@ -139,6 +143,43 @@ def test_apps_with_extensions_query(
         assert assigned_permissions in returned_permission_codes
 
 
+def test_apps_query_no_permission(
+    staff_api_client, permission_manage_users, permission_manage_staff, app
+):
+    variables = {"filter": {}}
+    response = staff_api_client.post_graphql(
+        QUERY_APPS_WITH_FILTER, variables, permissions=[]
+    )
+    assert_no_permission(response)
+
+    response = staff_api_client.post_graphql(
+        QUERY_APPS_WITH_FILTER,
+        variables,
+        permissions=[permission_manage_users, permission_manage_staff],
+    )
+    assert_no_permission(response)
+
+
+def test_apps_query_marked_as_removed(
+    staff_api_client, permission_manage_apps, app, removed_app
+):
+    # given
+
+    # when
+    response = staff_api_client.post_graphql(
+        QUERY_APPS_WITH_FILTER,
+        {},
+        permissions=[permission_manage_apps],
+    )
+
+    # then
+    content = get_graphql_content(response)
+
+    apps_data = content["data"]["apps"]["edges"]
+    assert apps_data[0]["node"]["name"] == app.name
+    assert len(apps_data) == 1
+
+
 QUERY_APPS_WITH_SORT = """
     query ($sort_by: AppSortingInput!) {
         apps(first:5, sortBy: $sort_by) {
@@ -153,7 +194,7 @@ QUERY_APPS_WITH_SORT = """
 
 
 @pytest.mark.parametrize(
-    "apps_sort, result_order",
+    ("apps_sort", "result_order"),
     [
         ({"field": "NAME", "direction": "ASC"}, ["facebook", "google"]),
         ({"field": "NAME", "direction": "DESC"}, ["google", "facebook"]),
@@ -181,21 +222,30 @@ def test_query_apps_with_sort(
         assert apps[order]["node"]["name"] == account_name
 
 
-def test_apps_query_no_permission(
-    staff_api_client, permission_manage_users, permission_manage_staff, app
-):
-    variables = {"filter": {}}
-    response = staff_api_client.post_graphql(
-        QUERY_APPS_WITH_FILTER, variables, permissions=[]
-    )
-    assert_no_permission(response)
+QUERY_APPS = """
+query {
+    apps(first: 5){
+        edges {
+            node {
+                id
+            }
+        }
+    }
+}
+"""
 
-    response = staff_api_client.post_graphql(
-        QUERY_APPS_WITH_FILTER,
-        variables,
-        permissions=[permission_manage_users, permission_manage_staff],
-    )
-    assert_no_permission(response)
+
+def test_apps_query_pending_installation(staff_api_client, app):
+    # given
+    app.is_installed = False
+    app.save(update_fields=["is_installed"])
+
+    # when
+    response = staff_api_client.post_graphql(QUERY_APPS)
+    content = get_graphql_content(response)
+
+    # then
+    assert content["data"]["apps"]["edges"] == []
 
 
 QUERY_APPS_FOR_FEDERATION = """
@@ -252,3 +302,184 @@ def test_query_app_for_federation_without_permission(api_client, app):
     response = api_client.post_graphql(QUERY_APPS_FOR_FEDERATION, variables)
     content = get_graphql_content(response)
     assert content["data"]["_entities"] == [None]
+
+
+QUERY_APPS_AVAILABLE_FOR_STAFF_WITHOUT_MANAGE_APPS = """
+    query{
+        apps(first: 5){
+            edges{
+                node{
+                    id
+                    isActive
+                    permissions{
+                        name
+                        code
+                    }
+                    name
+                    type
+                    aboutApp
+                    dataPrivacy
+                    dataPrivacyUrl
+                    homepageUrl
+                    supportUrl
+                    configurationUrl
+                    appUrl
+                    accessToken
+                    extensions{
+                        id
+                        label
+                        url
+                        mount
+                        target
+                        permissions{
+                            code
+                        }
+                    }
+                }
+            }
+        }
+    }
+"""
+
+
+@freeze_time("2018-05-31 12:00:01")
+def test_apps_query_staff_without_permissions(
+    staff_api_client,
+    staff_user,
+    permission_manage_apps,
+    permission_manage_orders,
+    app,
+):
+    # given
+    app.type = AppType.THIRDPARTY
+    app.save()
+    # when
+    response = staff_api_client.post_graphql(
+        QUERY_APPS_AVAILABLE_FOR_STAFF_WITHOUT_MANAGE_APPS,
+    )
+
+    # then
+    content = get_graphql_content(response)
+
+    apps_data = content["data"]["apps"]["edges"]
+
+    assert len(apps_data) == 1
+    app_data = apps_data[0]["node"]
+    expected_id = graphene.Node.to_global_id("App", app.id)
+    assert app_data["id"] == expected_id
+    assert app_data["accessToken"] == create_access_token_for_app(app, staff_user)
+
+
+def test_apps_query_for_normal_user(
+    user_api_client, permission_manage_users, permission_manage_staff, app
+):
+    # when
+    response = user_api_client.post_graphql(
+        QUERY_APPS_AVAILABLE_FOR_STAFF_WITHOUT_MANAGE_APPS,
+    )
+
+    # then
+    assert_no_permission(response)
+
+
+QUERY_APPS_WITH_METADATA = """
+    query{
+        apps(first: 5){
+            edges{
+                node{
+                    id
+                    metadata{
+                        key
+                        value
+                    }
+
+                }
+            }
+        }
+    }
+"""
+
+
+def test_apps_query_with_metadata_staff_user_without_permissions(
+    staff_api_client,
+    staff_user,
+    app,
+):
+    # given
+    app.type = AppType.THIRDPARTY
+    app.store_value_in_metadata({"test": "123"})
+    app.save()
+
+    # when
+    response = staff_api_client.post_graphql(
+        QUERY_APPS_WITH_METADATA,
+    )
+
+    # then
+    assert_no_permission(response)
+
+
+QUERY_APPS_WITH_METAFIELD = """
+    query{
+        apps(first: 5){
+            edges{
+                node{
+                    id
+                    metafield(key: "test")
+                }
+            }
+        }
+    }
+"""
+
+
+def test_apps_query_with_metafield_staff_user_without_permissions(
+    staff_api_client,
+    staff_user,
+    app,
+):
+    # given
+    app.type = AppType.THIRDPARTY
+    app.store_value_in_metadata({"test": "123"})
+    app.save()
+
+    # when
+    response = staff_api_client.post_graphql(
+        QUERY_APPS_WITH_METAFIELD,
+    )
+
+    # then
+    assert_no_permission(response)
+
+
+QUERY_APPS_WITH_METAFIELDS = """
+    query{
+        apps(first: 5){
+            edges{
+                node{
+                    id
+                    metafields(keys: ["test"])
+                }
+            }
+        }
+    }
+"""
+
+
+def test_apps_query_with_metafields_staff_user_without_permissions(
+    staff_api_client,
+    staff_user,
+    app,
+):
+    # given
+    app.type = AppType.THIRDPARTY
+    app.store_value_in_metadata({"test": "123"})
+    app.save()
+
+    # when
+    response = staff_api_client.post_graphql(
+        QUERY_APPS_WITH_METAFIELDS,
+    )
+
+    # then
+    assert_no_permission(response)

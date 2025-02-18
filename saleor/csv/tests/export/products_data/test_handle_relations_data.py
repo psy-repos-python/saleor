@@ -1,7 +1,10 @@
-from datetime import datetime
+import datetime
 from unittest.mock import patch
 
+from django.utils import timezone
+
 from .....attribute.models import Attribute, AttributeValue
+from .....attribute.tests.model_helpers import get_product_attributes
 from .....attribute.utils import associate_attribute_values_to_instance
 from .....product.models import Product, ProductMedia, ProductVariant, VariantMedia
 from .....tests.utils import dummy_editorjs
@@ -91,7 +94,8 @@ def test_get_products_relations_data_attribute_ids(
         product_type_product_reference_attribute,
     )
     associate_attribute_values_to_instance(
-        product, file_attribute, file_attribute.values.first()
+        product,
+        {file_attribute.id: [file_attribute.values.first()]},
     )
     page_ref_value = AttributeValue.objects.create(
         attribute=product_type_page_reference_attribute,
@@ -99,7 +103,8 @@ def test_get_products_relations_data_attribute_ids(
         name=page.title,
     )
     associate_attribute_values_to_instance(
-        product, product_type_page_reference_attribute, page_ref_value
+        product,
+        {product_type_page_reference_attribute.id: [page_ref_value]},
     )
     product_ref_value = AttributeValue.objects.create(
         attribute=product_type_product_reference_attribute,
@@ -107,7 +112,8 @@ def test_get_products_relations_data_attribute_ids(
         name=product_list[1].name,
     )
     associate_attribute_values_to_instance(
-        product, product_type_product_reference_attribute, product_ref_value
+        product,
+        {product_type_product_reference_attribute.id: [product_ref_value]},
     )
 
     qs = Product.objects.all()
@@ -165,7 +171,8 @@ def test_prepare_products_relations_data(
         file_attribute, product_type_page_reference_attribute
     )
     associate_attribute_values_to_instance(
-        product_with_image, file_attribute, file_attribute.values.first()
+        product_with_image,
+        {file_attribute.id: [file_attribute.values.first()]},
     )
     ref_value = AttributeValue.objects.create(
         attribute=product_type_page_reference_attribute,
@@ -175,7 +182,8 @@ def test_prepare_products_relations_data(
         date_time=None,
     )
     associate_attribute_values_to_instance(
-        product_with_image, product_type_page_reference_attribute, ref_value
+        product_with_image,
+        {product_type_page_reference_attribute.id: [ref_value]},
     )
 
     collection_list[0].products.add(product_with_image)
@@ -186,8 +194,7 @@ def test_prepare_products_relations_data(
         ProductExportFields.HEADERS_TO_FIELDS_MAPPING["product_many_to_many"].values()
     )
     attribute_ids = [
-        str(attr.assignment.attribute.pk)
-        for attr in product_with_image.attributes.all()
+        str(attr.pk) for attr in get_product_attributes(product_with_image)
     ]
     channel_ids = [str(channel_PLN.pk), str(channel_USD.pk)]
 
@@ -209,6 +216,7 @@ def test_prepare_products_relations_data(
     expected_result = add_product_attribute_data_to_expected_data(
         expected_result, product_with_image, attribute_ids, pk
     )
+
     expected_result = add_channel_to_expected_product_data(
         expected_result, product_with_image, channel_ids, pk
     )
@@ -250,8 +258,7 @@ def test_prepare_products_relations_data_only_attributes_ids(
     qs = Product.objects.all()
     fields = {"name"}
     attribute_ids = [
-        str(attr.assignment.attribute.pk)
-        for attr in product_with_image.attributes.all()
+        str(attr.pk) for attr in get_product_attributes(product_with_image)
     ]
     channel_ids = []
 
@@ -269,16 +276,20 @@ def test_prepare_products_relations_data_only_attributes_ids(
 
 
 def test_prepare_products_relations_data_only_channel_ids(
-    product_with_image, collection_list, channel_PLN, channel_USD
+    collection_list, channel_PLN, channel_USD, product_available_in_many_channels
 ):
     # given
-    pk = product_with_image.pk
-    collection_list[0].products.add(product_with_image)
-    collection_list[1].products.add(product_with_image)
+    pk = product_available_in_many_channels.pk
+
+    collection_list[0].products.add(product_available_in_many_channels)
+    collection_list[1].products.add(product_available_in_many_channels)
     qs = Product.objects.all()
     fields = {"name"}
     attribute_ids = []
     channel_ids = [str(channel_PLN.pk), str(channel_USD.pk)]
+    product_available_in_many_channels.channel_listings.update(
+        published_at=timezone.now()
+    )
 
     # when
     result = prepare_products_relations_data(qs, fields, attribute_ids, channel_ids)
@@ -287,33 +298,57 @@ def test_prepare_products_relations_data_only_channel_ids(
     expected_result = {pk: {}}
 
     expected_result = add_channel_to_expected_product_data(
-        expected_result, product_with_image, channel_ids, pk
+        expected_result, product_available_in_many_channels, channel_ids, pk
     )
 
     assert result == expected_result
 
 
-def test_prepare_products_relations_data_attribute_without_values(
-    product,
-    channel_USD,
-    channel_PLN,
+def test_prepare_products_relations_data_sets_published_dates(
+    collection_list, channel_PLN, channel_USD, product_available_in_many_channels
 ):
-    # given
-    pk = product.pk
-
-    attribute_product = product.attributes.first()
-    attribute_product.values.clear()
-    attribute = attribute_product.assignment.attribute
-
+    # givenq
+    collection_list[0].products.add(product_available_in_many_channels)
+    collection_list[1].products.add(product_available_in_many_channels)
     qs = Product.objects.all()
     fields = {"name"}
-    attribute_ids = [str(attribute.pk)]
+    attribute_ids = []
+    channel_ids = [str(channel_PLN.pk), str(channel_USD.pk)]
+    product_available_in_many_channels.channel_listings.update(
+        published_at=timezone.now()
+    )
+    usd_listing = product_available_in_many_channels.channel_listings.get(
+        channel=channel_USD
+    )
+    pln_listing = product_available_in_many_channels.channel_listings.get(
+        channel=channel_PLN
+    )
 
     # when
-    result = prepare_products_relations_data(qs, fields, attribute_ids, [])
+    result = prepare_products_relations_data(qs, fields, attribute_ids, channel_ids)
 
     # then
-    assert result == {pk: {f"{attribute.slug} (product attribute)": ""}}
+    single_result = result[product_available_in_many_channels.pk]
+
+    assert usd_listing.published_at
+    assert pln_listing.published_at
+    assert (
+        single_result.get(f"{channel_USD.slug} (channel published at)")
+        == usd_listing.published_at
+    )
+    assert (
+        single_result.get(f"{channel_USD.slug} (channel publication date)")
+        == usd_listing.published_at
+    )
+
+    assert (
+        single_result.get(f"{channel_PLN.slug} (channel published at)")
+        == pln_listing.published_at
+    )
+    assert (
+        single_result.get(f"{channel_PLN.slug} (channel publication date)")
+        == pln_listing.published_at
+    )
 
 
 @patch("saleor.csv.utils.products_data.prepare_variants_relations_data")
@@ -386,7 +421,8 @@ def test_get_variants_relations_data_attribute_ids(
     )
     variant = product.variants.first()
     associate_attribute_values_to_instance(
-        variant, file_attribute, file_attribute.values.first()
+        variant,
+        {file_attribute.id: [file_attribute.values.first()]},
     )
     # add page reference attribute
     page_ref_value = AttributeValue.objects.create(
@@ -395,7 +431,8 @@ def test_get_variants_relations_data_attribute_ids(
         name=page.title,
     )
     associate_attribute_values_to_instance(
-        variant, product_type_page_reference_attribute, page_ref_value
+        variant,
+        {product_type_page_reference_attribute.id: [page_ref_value]},
     )
     # add product reference attribute
     product_ref_value = AttributeValue.objects.create(
@@ -404,7 +441,8 @@ def test_get_variants_relations_data_attribute_ids(
         name=product_list[1].name,
     )
     associate_attribute_values_to_instance(
-        variant, product_type_product_reference_attribute, product_ref_value
+        variant,
+        {product_type_product_reference_attribute.id: [product_ref_value]},
     )
 
     qs = Product.objects.all()
@@ -523,7 +561,8 @@ def test_prepare_variants_relations_data(
     )
     variant = product_1.variants.first()
     associate_attribute_values_to_instance(
-        variant, file_attribute, file_attribute.values.first()
+        variant,
+        {file_attribute.id: [file_attribute.values.first()]},
     )
     # add page reference attribute
     page_ref_value = AttributeValue.objects.create(
@@ -533,7 +572,8 @@ def test_prepare_variants_relations_data(
         name=page.title,
     )
     associate_attribute_values_to_instance(
-        variant, product_type_page_reference_attribute, page_ref_value
+        variant,
+        {product_type_page_reference_attribute.id: [page_ref_value]},
     )
     # add prodcut reference attribute
     product_ref_value = AttributeValue.objects.create(
@@ -543,7 +583,8 @@ def test_prepare_variants_relations_data(
         name=product.name,
     )
     associate_attribute_values_to_instance(
-        variant, product_type_product_reference_attribute, product_ref_value
+        variant,
+        {product_type_product_reference_attribute.id: [product_ref_value]},
     )
 
     qs = Product.objects.all()
@@ -1081,7 +1122,7 @@ def test_add_reference_info_to_data_update_attribute_data(product, page):
 def test_add_date_time_attribute_info_to_data(product, date_time_attribute):
     # given
     pk = product.pk
-    date_time = datetime(2021, 7, 15, 2, 3)
+    date_time = datetime.datetime(2021, 7, 15, 2, 3, tzinfo=datetime.UTC)
     attribute_data = AttributeData(
         slug=date_time_attribute.slug,
         value_slug=None,
@@ -1112,7 +1153,7 @@ def test_add_date_time_attribute_info_to_data(product, date_time_attribute):
 def test_add_date_attribute_info_to_data(product, date_attribute):
     # given
     pk = product.pk
-    date = datetime(2021, 8, 10, 5, 3)
+    date = datetime.datetime(2021, 8, 10, 5, 3, tzinfo=datetime.UTC)
     attribute_data = AttributeData(
         slug=date_attribute.slug,
         value_slug=None,
@@ -1463,10 +1504,9 @@ def test_add_channel_info_to_data(product):
         "published": True,
     }
     input_data = {pk: {}}
-    fields = ["currency_code", "published"]
 
     # when
-    result = add_channel_info_to_data(product.pk, channel_data, input_data, fields)
+    result = add_channel_info_to_data(product.pk, channel_data, input_data)
 
     # then
     assert len(result[pk]) == 2
@@ -1491,10 +1531,9 @@ def test_add_channel_info_to_data_not_changed(product):
             f"{slug} (channel published)": True,
         }
     }
-    fields = ["currency_code", "published"]
 
     # when
-    result = add_channel_info_to_data(product.pk, channel_data, input_data, fields)
+    result = add_channel_info_to_data(product.pk, channel_data, input_data)
 
     # then
     assert result == input_data
@@ -1509,10 +1548,9 @@ def test_add_channel_info_to_data_no_slug(product):
         "published": None,
     }
     input_data = {pk: {}}
-    fields = ["currency_code"]
 
     # when
-    result = add_channel_info_to_data(product.pk, channel_data, input_data, fields)
+    result = add_channel_info_to_data(product.pk, channel_data, input_data)
 
     # then
     assert result == input_data

@@ -1,11 +1,18 @@
-from datetime import date, timedelta
+import datetime
+import json
 from unittest import mock
 
+import graphene
 import pytest
+from django.utils.functional import SimpleLazyObject
+from freezegun import freeze_time
 
+from .....core.utils.json_serializer import CustomJsonEncoder
 from .....giftcard import GiftCardEvents
 from .....giftcard.error_codes import GiftCardErrorCode
 from .....giftcard.models import GiftCard
+from .....webhook.event_types import WebhookEventAsyncType
+from .....webhook.payloads import generate_meta, generate_requestor
 from ....tests.utils import assert_no_permission, get_graphql_content
 
 CREATE_GIFT_CARD_MUTATION = """
@@ -83,7 +90,9 @@ CREATE_GIFT_CARD_MUTATION = """
 """
 
 
-@mock.patch("saleor.graphql.giftcard.mutations.send_gift_card_notification")
+@mock.patch(
+    "saleor.graphql.giftcard.mutations.gift_card_create.send_gift_card_notification"
+)
 def test_create_never_expiry_gift_card(
     send_notification_mock,
     staff_api_client,
@@ -178,7 +187,9 @@ def test_create_never_expiry_gift_card(
     )
 
 
-@mock.patch("saleor.graphql.giftcard.mutations.send_gift_card_notification")
+@mock.patch(
+    "saleor.graphql.giftcard.mutations.gift_card_create.send_gift_card_notification"
+)
 def test_create_gift_card_by_app(
     send_notification_mock,
     app_api_client,
@@ -494,7 +505,9 @@ def test_create_gift_card_with_zero_balance_amount(
     assert errors[0]["code"] == GiftCardErrorCode.INVALID.name
 
 
-@mock.patch("saleor.graphql.giftcard.mutations.send_gift_card_notification")
+@mock.patch(
+    "saleor.graphql.giftcard.mutations.gift_card_create.send_gift_card_notification"
+)
 def test_create_gift_card_with_expiry_date(
     send_notification_mock,
     staff_api_client,
@@ -507,7 +520,9 @@ def test_create_gift_card_with_expiry_date(
     # given
     initial_balance = 100
     currency = "USD"
-    date_value = date.today() + timedelta(days=365)
+    date_value = datetime.datetime.now(tz=datetime.UTC).date() + datetime.timedelta(
+        days=365
+    )
     tag = "gift-card-tag"
     variables = {
         "input": {
@@ -570,7 +585,10 @@ def test_create_gift_card_with_expiry_date(
     )
 
 
-@pytest.mark.parametrize("date_value", [date(1999, 1, 1), date.today()])
+@pytest.mark.parametrize(
+    "date_value",
+    [datetime.date(1999, 1, 1), datetime.datetime.now(tz=datetime.UTC).date()],
+)
 def test_create_gift_card_with_expiry_date_type_invalid(
     date_value,
     staff_api_client,
@@ -617,3 +635,233 @@ def test_create_gift_card_with_expiry_date_type_invalid(
     assert len(errors) == 1
     assert errors[0]["field"] == "expiryDate"
     assert errors[0]["code"] == GiftCardErrorCode.INVALID.name
+
+
+@freeze_time("2022-05-12 12:00:00")
+@mock.patch("saleor.plugins.webhook.plugin.get_webhooks_for_event")
+@mock.patch("saleor.plugins.webhook.plugin.trigger_webhooks_async")
+def test_create_gift_card_trigger_webhook(
+    mocked_webhook_trigger,
+    mocked_get_webhooks_for_event,
+    any_webhook,
+    app_api_client,
+    permission_manage_gift_card,
+    permission_manage_users,
+    settings,
+):
+    # given
+    mocked_get_webhooks_for_event.return_value = [any_webhook]
+    settings.PLUGINS = ["saleor.plugins.webhook.plugin.WebhookPlugin"]
+
+    initial_balance = 100
+    currency = "USD"
+    tag = "gift-card-tag"
+    note = "This is gift card note that will be save in gift card event."
+    variables = {
+        "input": {
+            "balance": {
+                "amount": initial_balance,
+                "currency": currency,
+            },
+            "addTags": [tag],
+            "note": note,
+            "expiryDate": None,
+            "isActive": False,
+        }
+    }
+
+    # when
+    response = app_api_client.post_graphql(
+        CREATE_GIFT_CARD_MUTATION,
+        variables,
+        permissions=[permission_manage_gift_card, permission_manage_users],
+    )
+    gift_card = GiftCard.objects.last()
+
+    # then
+    content = get_graphql_content(response)
+    errors = content["data"]["giftCardCreate"]["errors"]
+    data = content["data"]["giftCardCreate"]["giftCard"]
+
+    assert not errors
+    assert data["code"]
+
+    mocked_webhook_trigger.assert_called_once_with(
+        json.dumps(
+            {
+                "id": graphene.Node.to_global_id("GiftCard", gift_card.id),
+                "is_active": gift_card.is_active,
+                "meta": generate_meta(
+                    requestor_data=generate_requestor(
+                        SimpleLazyObject(lambda: app_api_client.app)
+                    )
+                ),
+            },
+            cls=CustomJsonEncoder,
+        ),
+        WebhookEventAsyncType.GIFT_CARD_CREATED,
+        [any_webhook],
+        gift_card,
+        SimpleLazyObject(lambda: app_api_client.app),
+        allow_replica=False,
+    )
+
+
+@freeze_time("2022-05-12 12:00:00")
+@mock.patch("saleor.plugins.webhook.plugin.get_webhooks_for_event")
+@mock.patch("saleor.plugins.webhook.plugin.trigger_webhooks_async")
+def test_create_gift_card_with_email_triggers_gift_card_sent_webhook(
+    mocked_webhook_trigger,
+    mocked_get_webhooks_for_event,
+    any_webhook,
+    app_api_client,
+    channel_USD,
+    customer_user,
+    permission_manage_gift_card,
+    permission_manage_users,
+    settings,
+):
+    # given
+    mocked_get_webhooks_for_event.return_value = [any_webhook]
+    settings.PLUGINS = ["saleor.plugins.webhook.plugin.WebhookPlugin"]
+
+    initial_balance = 100
+    currency = "USD"
+    tag = "gift-card-tag"
+    note = "This is gift card note that will be save in gift card event."
+    variables = {
+        "input": {
+            "balance": {
+                "amount": initial_balance,
+                "currency": currency,
+            },
+            "addTags": [tag],
+            "note": note,
+            "expiryDate": None,
+            "isActive": False,
+            "channel": channel_USD.slug,
+            "userEmail": customer_user.email,
+        }
+    }
+
+    # when
+    response = app_api_client.post_graphql(
+        CREATE_GIFT_CARD_MUTATION,
+        variables,
+        permissions=[permission_manage_gift_card, permission_manage_users],
+    )
+    gift_card = GiftCard.objects.last()
+
+    # then
+    content = get_graphql_content(response)
+    errors = content["data"]["giftCardCreate"]["errors"]
+    data = content["data"]["giftCardCreate"]["giftCard"]
+
+    assert not errors
+    assert data["code"]
+
+    mocked_webhook_trigger.assert_any_call(
+        json.dumps(
+            {
+                "id": graphene.Node.to_global_id("GiftCard", gift_card.id),
+                "is_active": gift_card.is_active,
+                "channel_slug": channel_USD.slug,
+                "sent_to_email": customer_user.email,
+                "meta": generate_meta(
+                    requestor_data=generate_requestor(
+                        SimpleLazyObject(lambda: app_api_client.app)
+                    )
+                ),
+            },
+            cls=CustomJsonEncoder,
+        ),
+        WebhookEventAsyncType.GIFT_CARD_SENT,
+        [any_webhook],
+        {
+            "gift_card": gift_card,
+            "channel_slug": channel_USD.slug,
+            "sent_to_email": customer_user.email,
+        },
+        SimpleLazyObject(lambda: app_api_client.app),
+        allow_replica=False,
+    )
+
+
+def test_create_gift_card_with_code(
+    staff_api_client,
+    permission_manage_gift_card,
+    permission_manage_users,
+    permission_manage_apps,
+):
+    # given
+    code = "custom-code"
+    variables = {
+        "input": {
+            "balance": {
+                "amount": 1,
+                "currency": "USD",
+            },
+            "code": code,
+            "isActive": True,
+        }
+    }
+
+    # when
+    response = staff_api_client.post_graphql(
+        CREATE_GIFT_CARD_MUTATION,
+        variables,
+        permissions=[
+            permission_manage_gift_card,
+            permission_manage_users,
+            permission_manage_apps,
+        ],
+    )
+
+    # then
+    content = get_graphql_content(response)
+    errors = content["data"]["giftCardCreate"]["errors"]
+    data = content["data"]["giftCardCreate"]["giftCard"]
+
+    assert not errors
+    assert data["code"] == code
+
+
+def test_create_gift_card_with_to_short_code(
+    staff_api_client,
+    permission_manage_gift_card,
+    permission_manage_users,
+    permission_manage_apps,
+):
+    # given
+    code = "short"
+    variables = {
+        "input": {
+            "balance": {
+                "amount": 1,
+                "currency": "USD",
+            },
+            "code": code,
+            "isActive": True,
+        }
+    }
+
+    # when
+    response = staff_api_client.post_graphql(
+        CREATE_GIFT_CARD_MUTATION,
+        variables,
+        permissions=[
+            permission_manage_gift_card,
+            permission_manage_users,
+            permission_manage_apps,
+        ],
+    )
+
+    # then
+    content = get_graphql_content(response)
+    errors = content["data"]["giftCardCreate"]["errors"]
+    data = content["data"]["giftCardCreate"]["giftCard"]
+
+    assert not data
+    assert len(errors) == 1
+    assert errors[0]["field"] == "code"
+    assert errors[0]["code"] == "INVALID"

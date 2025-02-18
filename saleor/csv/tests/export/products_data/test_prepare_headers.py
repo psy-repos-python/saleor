@@ -122,6 +122,7 @@ def test_get_channels_headers(channel_USD, channel_PLN):
             "product currency code",
             "published",
             "publication date",
+            "published at",
             "searchable",
             "available for purchase",
             "price amount",
@@ -149,7 +150,7 @@ def test_get_product_export_fields_and_headers_info(
 ):
     # given
     warehouse_ids = [w.pk for w in warehouses]
-    attribute_ids = [attr.pk for attr in Attribute.objects.all()]
+    attribute_ids = [str(attr.pk) for attr in Attribute.objects.all()]
     channel_ids = [channel_PLN.pk, channel_USD.pk]
     export_info = {
         "fields": [
@@ -198,6 +199,7 @@ def test_get_product_export_fields_and_headers_info(
             "product currency code",
             "published",
             "publication date",
+            "published at",
             "searchable",
             "available for purchase",
             "price amount",

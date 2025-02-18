@@ -1,18 +1,26 @@
-from datetime import date
+import datetime
+from functools import partial
 from unittest import mock
+from unittest.mock import ANY
 
 import graphene
 import pytest
+from django.conf import settings
+from django.utils import timezone
+from django.utils.functional import SimpleLazyObject
 from django.utils.text import slugify
 from freezegun import freeze_time
 
 from .....attribute.models import AttributeValue
+from .....attribute.tests.model_helpers import (
+    get_page_attribute_values,
+    get_page_attributes,
+)
 from .....attribute.utils import associate_attribute_values_to_instance
 from .....page.error_codes import PageErrorCode
 from .....page.models import Page
 from .....tests.utils import dummy_editorjs
 from .....webhook.event_types import WebhookEventAsyncType
-from .....webhook.payloads import generate_page_payload
 from ....tests.utils import get_graphql_content
 
 UPDATE_PAGE_MUTATION = """
@@ -27,7 +35,7 @@ UPDATE_PAGE_MUTATION = """
                 title
                 slug
                 isPublished
-                publicationDate
+                publishedAt
                 attributes {
                     attribute {
                         slug
@@ -40,6 +48,7 @@ UPDATE_PAGE_MUTATION = """
                             url
                             contentType
                         }
+                        plainText
                     }
                 }
             }
@@ -91,14 +100,19 @@ def test_update_page(staff_api_client, permission_manage_pages, page):
     assert data["page"]["slug"] == new_slug
 
     expected_attributes = []
-    page_attr = page.attributes.all()
     for attr in page_type.page_attributes.all():
         if attr.slug != tag_attr.slug:
             values = [
-                {"slug": slug, "file": None, "name": name, "reference": None}
-                for slug, name in page_attr.filter(
-                    assignment__attribute=attr
-                ).values_list("values__slug", "values__name")
+                {
+                    "slug": slug,
+                    "file": None,
+                    "name": name,
+                    "reference": None,
+                    "plainText": None,
+                }
+                for slug, name in get_page_attribute_values(page, attr).values_list(
+                    "slug", "name"
+                )
             ]
         else:
             values = [
@@ -106,6 +120,7 @@ def test_update_page(staff_api_client, permission_manage_pages, page):
                     "slug": slugify(new_value),
                     "file": None,
                     "name": new_value,
+                    "plainText": None,
                     "reference": None,
                 }
             ]
@@ -121,7 +136,7 @@ def test_update_page(staff_api_client, permission_manage_pages, page):
         assert attr_data in expected_attributes
 
 
-@mock.patch("saleor.plugins.webhook.plugin._get_webhooks_for_event")
+@mock.patch("saleor.plugins.webhook.plugin.get_webhooks_for_event")
 @mock.patch("saleor.plugins.webhook.plugin.trigger_webhooks_async")
 @freeze_time("2020-03-18 12:00:00")
 def test_update_page_trigger_webhook(
@@ -164,10 +179,18 @@ def test_update_page_trigger_webhook(
     assert not data["errors"]
     assert data["page"]["title"] == page_title
     assert data["page"]["slug"] == new_slug
-    page.publication_date = date(2020, 3, 18)
-    expected_data = generate_page_payload(page, staff_api_client.user)
+    page.published_at = timezone.now()
     mocked_webhook_trigger.assert_called_once_with(
-        expected_data, WebhookEventAsyncType.PAGE_UPDATED, [any_webhook]
+        None,
+        WebhookEventAsyncType.PAGE_UPDATED,
+        [any_webhook],
+        page,
+        SimpleLazyObject(lambda: staff_api_client.user),
+        legacy_data_generator=ANY,
+        allow_replica=False,
+    )
+    assert isinstance(
+        mocked_webhook_trigger.call_args.kwargs["legacy_data_generator"], partial
     )
 
 
@@ -205,12 +228,17 @@ def test_update_page_only_title(staff_api_client, permission_manage_pages, page)
     assert data["page"]["slug"] == new_slug
 
     expected_attributes = []
-    page_attr = page.attributes.all()
     for attr in page_type.page_attributes.all():
         values = [
-            {"slug": slug, "file": None, "name": name, "reference": None}
-            for slug, name in page_attr.filter(assignment__attribute=attr).values_list(
-                "values__slug", "values__name"
+            {
+                "slug": slug,
+                "file": None,
+                "name": name,
+                "reference": None,
+                "plainText": None,
+            }
+            for slug, name in get_page_attribute_values(page, attr).values_list(
+                "slug", "name"
             )
         ]
         attr_data = {
@@ -226,23 +254,24 @@ def test_update_page_only_title(staff_api_client, permission_manage_pages, page)
 
 
 def test_update_page_with_file_attribute_value(
-    staff_api_client, permission_manage_pages, page, page_file_attribute
+    staff_api_client, permission_manage_pages, page, page_file_attribute, site_settings
 ):
     # given
     query = UPDATE_PAGE_MUTATION
 
     page_type = page.page_type
     page_type.page_attributes.add(page_file_attribute)
-    new_value = "test.txt"
     page_file_attribute_id = graphene.Node.to_global_id(
         "Attribute", page_file_attribute.pk
     )
 
     page_id = graphene.Node.to_global_id("Page", page.id)
+    file_name = "test.txt"
+    file_url = f"http://{site_settings.site.domain}{settings.MEDIA_URL}{file_name}"
 
     variables = {
         "id": page_id,
-        "input": {"attributes": [{"id": page_file_attribute_id, "file": new_value}]},
+        "input": {"attributes": [{"id": page_file_attribute_id, "file": file_url}]},
     }
 
     # when
@@ -260,11 +289,12 @@ def test_update_page_with_file_attribute_value(
         "attribute": {"slug": page_file_attribute.slug},
         "values": [
             {
-                "slug": slugify(new_value),
-                "name": new_value,
+                "slug": slugify(file_name),
+                "name": file_name,
+                "plainText": None,
                 "reference": None,
                 "file": {
-                    "url": "http://testserver/media/" + new_value,
+                    "url": file_url,
                     "contentType": None,
                 },
             }
@@ -274,7 +304,7 @@ def test_update_page_with_file_attribute_value(
 
 
 def test_update_page_with_file_attribute_new_value_is_not_created(
-    staff_api_client, permission_manage_pages, page, page_file_attribute
+    staff_api_client, permission_manage_pages, page, page_file_attribute, site_settings
 ):
     # given
     query = UPDATE_PAGE_MUTATION
@@ -285,17 +315,17 @@ def test_update_page_with_file_attribute_new_value_is_not_created(
         "Attribute", page_file_attribute.pk
     )
     existing_value = page_file_attribute.values.first()
-    associate_attribute_values_to_instance(page, page_file_attribute, existing_value)
+    associate_attribute_values_to_instance(
+        page, {page_file_attribute.pk: [existing_value]}
+    )
 
     page_id = graphene.Node.to_global_id("Page", page.id)
+    domain = site_settings.site.domain
+    file_url = f"http://{domain}{settings.MEDIA_URL}{existing_value.file_url}"
 
     variables = {
         "id": page_id,
-        "input": {
-            "attributes": [
-                {"id": page_file_attribute_id, "file": existing_value.file_url}
-            ]
-        },
+        "input": {"attributes": [{"id": page_file_attribute_id, "file": file_url}]},
     }
 
     # when
@@ -315,9 +345,10 @@ def test_update_page_with_file_attribute_new_value_is_not_created(
             {
                 "slug": existing_value.slug,
                 "name": existing_value.name,
+                "plainText": None,
                 "reference": None,
                 "file": {
-                    "url": f"http://testserver/media/{existing_value.file_url}",
+                    "url": file_url,
                     "contentType": existing_value.content_type,
                 },
             }
@@ -326,12 +357,23 @@ def test_update_page_with_file_attribute_new_value_is_not_created(
     assert updated_attribute in data["page"]["attributes"]
 
 
-def test_update_page_clear_values(staff_api_client, permission_manage_pages, page):
+def test_update_page_clear_file_attribute_values(
+    staff_api_client, permission_manage_pages, page, page_file_attribute
+):
     # given
     query = UPDATE_PAGE_MUTATION
 
-    page_attr = page.attributes.first()
-    attribute = page_attr.assignment.attribute
+    page_type = page.page_type
+    page_type.page_attributes.add(page_file_attribute)
+    page_file_attribute_id = graphene.Node.to_global_id(
+        "Attribute", page_file_attribute.pk
+    )
+    existing_value = page_file_attribute.values.first()
+    associate_attribute_values_to_instance(
+        page, {page_file_attribute.pk: [existing_value]}
+    )
+
+    attribute = page_file_attribute
     attribute.value_required = False
     attribute.save(update_fields=["value_required"])
 
@@ -352,13 +394,15 @@ def test_update_page_clear_values(staff_api_client, permission_manage_pages, pag
     # then
     content = get_graphql_content(response)
     data = content["data"]["pageUpdate"]
-
     assert not data["errors"]
     assert data["page"]
-    assert not data["page"]["attributes"][0]["values"]
-
-    with pytest.raises(page_attr._meta.model.DoesNotExist):
-        page_attr.refresh_from_db()
+    attr_data = [
+        attr
+        for attr in data["page"]["attributes"]
+        if attr["attribute"]["slug"] == attribute.slug
+    ][0]
+    assert not attr_data["values"]
+    assert not get_page_attribute_values(page, page_file_attribute).exists()
 
 
 def test_update_page_with_page_reference_attribute_new_value(
@@ -406,6 +450,7 @@ def test_update_page_with_page_reference_attribute_new_value(
                 "slug": f"{page.pk}_{ref_page.pk}",
                 "name": page.title,
                 "file": None,
+                "plainText": None,
                 "reference": reference,
             }
         ],
@@ -437,7 +482,7 @@ def test_update_page_with_page_reference_attribute_existing_value(
         reference_page=ref_page,
     )
     associate_attribute_values_to_instance(
-        page, page_type_page_reference_attribute, attr_value
+        page, {page_type_page_reference_attribute.pk: [attr_value]}
     )
 
     values_count = page_type_page_reference_attribute.values.count()
@@ -471,6 +516,7 @@ def test_update_page_with_page_reference_attribute_existing_value(
                 "slug": attr_value.slug,
                 "file": None,
                 "name": page.title,
+                "plainText": None,
                 "reference": reference,
             }
         ],
@@ -479,6 +525,168 @@ def test_update_page_with_page_reference_attribute_existing_value(
 
     page_type_page_reference_attribute.refresh_from_db()
     assert page_type_page_reference_attribute.values.count() == values_count
+
+
+def test_update_page_with_plain_text_attribute_new_value(
+    staff_api_client,
+    permission_manage_pages,
+    page_list,
+    plain_text_attribute_page_type,
+):
+    # given
+    query = UPDATE_PAGE_MUTATION
+
+    page = page_list[0]
+    page_type = page.page_type
+    page_type.page_attributes.add(plain_text_attribute_page_type)
+
+    values_count = plain_text_attribute_page_type.values.count()
+    attribute_id = graphene.Node.to_global_id(
+        "Attribute", plain_text_attribute_page_type.pk
+    )
+    text = "test plain text attribute content"
+
+    page_id = graphene.Node.to_global_id("Page", page.id)
+
+    variables = {
+        "id": page_id,
+        "input": {"attributes": [{"id": attribute_id, "plainText": text}]},
+    }
+
+    # when
+    response = staff_api_client.post_graphql(
+        query, variables, permissions=[permission_manage_pages]
+    )
+
+    # then
+    content = get_graphql_content(response)
+    data = content["data"]["pageUpdate"]
+
+    assert not data["errors"]
+    assert data["page"]
+    updated_attribute = {
+        "attribute": {"slug": plain_text_attribute_page_type.slug},
+        "values": [
+            {
+                "slug": f"{page.pk}_{plain_text_attribute_page_type.pk}",
+                "name": text,
+                "file": None,
+                "reference": None,
+                "plainText": text,
+            }
+        ],
+    }
+    assert updated_attribute in data["page"]["attributes"]
+
+    plain_text_attribute_page_type.refresh_from_db()
+    assert plain_text_attribute_page_type.values.count() == values_count + 1
+
+
+def test_update_page_with_plain_text_attribute_existing_value(
+    staff_api_client,
+    permission_manage_pages,
+    page_list,
+    plain_text_attribute_page_type,
+):
+    # given
+    query = UPDATE_PAGE_MUTATION
+
+    page = page_list[0]
+    page_type = page.page_type
+    page_type.page_attributes.add(plain_text_attribute_page_type)
+
+    values_count = plain_text_attribute_page_type.values.count()
+    attribute_id = graphene.Node.to_global_id(
+        "Attribute", plain_text_attribute_page_type.pk
+    )
+    attribute_value = plain_text_attribute_page_type.values.first()
+    attribute_value.slug = f"{page.pk}_{plain_text_attribute_page_type.pk}"
+    attribute_value.save(update_fields=["slug"])
+
+    text = attribute_value.plain_text
+
+    page_id = graphene.Node.to_global_id("Page", page.id)
+
+    variables = {
+        "id": page_id,
+        "input": {"attributes": [{"id": attribute_id, "plainText": text}]},
+    }
+
+    # when
+    response = staff_api_client.post_graphql(
+        query, variables, permissions=[permission_manage_pages]
+    )
+
+    # then
+    content = get_graphql_content(response)
+    data = content["data"]["pageUpdate"]
+
+    assert not data["errors"]
+    assert data["page"]
+    updated_attribute = {
+        "attribute": {"slug": plain_text_attribute_page_type.slug},
+        "values": [
+            {
+                "slug": attribute_value.slug,
+                "name": text,
+                "file": None,
+                "reference": None,
+                "plainText": text,
+            }
+        ],
+    }
+    assert updated_attribute in data["page"]["attributes"]
+
+    plain_text_attribute_page_type.refresh_from_db()
+    assert plain_text_attribute_page_type.values.count() == values_count
+
+
+@pytest.mark.parametrize("value", ["", "  ", None])
+def test_update_page_with_required_plain_text_attribute_empty_value(
+    value,
+    staff_api_client,
+    permission_manage_pages,
+    page_list,
+    plain_text_attribute_page_type,
+):
+    # given
+    query = UPDATE_PAGE_MUTATION
+
+    page = page_list[0]
+    page_type = page.page_type
+    page_type.page_attributes.add(plain_text_attribute_page_type)
+
+    attribute_id = graphene.Node.to_global_id(
+        "Attribute", plain_text_attribute_page_type.pk
+    )
+    attribute_value = plain_text_attribute_page_type.values.first()
+    attribute_value.slug = f"{page.pk}_{plain_text_attribute_page_type.pk}"
+    attribute_value.save(update_fields=["slug"])
+
+    plain_text_attribute_page_type.value_required = True
+    plain_text_attribute_page_type.save(update_fields=["value_required"])
+
+    page_id = graphene.Node.to_global_id("Page", page.id)
+
+    variables = {
+        "id": page_id,
+        "input": {"attributes": [{"id": attribute_id, "plainText": value}]},
+    }
+
+    # when
+    response = staff_api_client.post_graphql(
+        query, variables, permissions=[permission_manage_pages]
+    )
+
+    # then
+    content = get_graphql_content(response)
+    data = content["data"]["pageUpdate"]
+    errors = data["errors"]
+
+    assert not data["page"]
+    assert len(errors) == 1
+    assert errors[0]["code"] == PageErrorCode.REQUIRED.name
+    assert errors[0]["field"] == "attributes"
 
 
 def test_update_page_with_product_reference_attribute_new_value(
@@ -525,6 +733,7 @@ def test_update_page_with_product_reference_attribute_new_value(
                 "slug": f"{page.pk}_{product.pk}",
                 "name": product.name,
                 "file": None,
+                "plainText": None,
                 "reference": reference,
             }
         ],
@@ -555,7 +764,7 @@ def test_update_page_with_product_reference_attribute_existing_value(
         reference_product=product,
     )
     associate_attribute_values_to_instance(
-        page, page_type_product_reference_attribute, attr_value
+        page, {page_type_product_reference_attribute.pk: [attr_value]}
     )
 
     values_count = page_type_product_reference_attribute.values.count()
@@ -590,6 +799,7 @@ def test_update_page_with_product_reference_attribute_existing_value(
                 "file": None,
                 "name": page.title,
                 "reference": reference,
+                "plainText": None,
             }
         ],
     }
@@ -597,6 +807,126 @@ def test_update_page_with_product_reference_attribute_existing_value(
 
     page_type_product_reference_attribute.refresh_from_db()
     assert page_type_product_reference_attribute.values.count() == values_count
+
+
+def test_update_page_with_variant_reference_attribute_new_value(
+    staff_api_client,
+    permission_manage_pages,
+    page,
+    page_type_variant_reference_attribute,
+    variant,
+):
+    # given
+    query = UPDATE_PAGE_MUTATION
+
+    page_type = page.page_type
+    page_type.page_attributes.add(page_type_variant_reference_attribute)
+
+    values_count = page_type_variant_reference_attribute.values.count()
+    ref_attribute_id = graphene.Node.to_global_id(
+        "Attribute", page_type_variant_reference_attribute.pk
+    )
+    reference = graphene.Node.to_global_id("ProductVariant", variant.pk)
+
+    page_id = graphene.Node.to_global_id("Page", page.id)
+
+    variables = {
+        "id": page_id,
+        "input": {"attributes": [{"id": ref_attribute_id, "references": [reference]}]},
+    }
+
+    # when
+    response = staff_api_client.post_graphql(
+        query, variables, permissions=[permission_manage_pages]
+    )
+
+    # then
+    content = get_graphql_content(response)
+    data = content["data"]["pageUpdate"]
+
+    assert not data["errors"]
+    assert data["page"]
+    updated_attribute = {
+        "attribute": {"slug": page_type_variant_reference_attribute.slug},
+        "values": [
+            {
+                "slug": f"{page.pk}_{variant.pk}",
+                "name": f"{variant.product.name}: {variant.name}",
+                "file": None,
+                "plainText": None,
+                "reference": reference,
+            }
+        ],
+    }
+    assert updated_attribute in data["page"]["attributes"]
+
+    page_type_variant_reference_attribute.refresh_from_db()
+    assert page_type_variant_reference_attribute.values.count() == values_count + 1
+
+
+def test_update_page_with_variant_reference_attribute_existing_value(
+    staff_api_client,
+    permission_manage_pages,
+    page,
+    page_type_variant_reference_attribute,
+    variant,
+):
+    # given
+    query = UPDATE_PAGE_MUTATION
+
+    page_type = page.page_type
+    page_type.page_attributes.add(page_type_variant_reference_attribute)
+
+    attr_value = AttributeValue.objects.create(
+        attribute=page_type_variant_reference_attribute,
+        name=page.title,
+        slug=f"{page.pk}_{variant.pk}",
+        reference_variant=variant,
+    )
+    associate_attribute_values_to_instance(
+        page, {page_type_variant_reference_attribute.pk: [attr_value]}
+    )
+
+    values_count = page_type_variant_reference_attribute.values.count()
+    ref_attribute_id = graphene.Node.to_global_id(
+        "Attribute", page_type_variant_reference_attribute.pk
+    )
+    reference = graphene.Node.to_global_id("ProductVariant", variant.pk)
+
+    page_id = graphene.Node.to_global_id("Page", page.id)
+
+    variables = {
+        "id": page_id,
+        "input": {"attributes": [{"id": ref_attribute_id, "references": [reference]}]},
+    }
+
+    # when
+    response = staff_api_client.post_graphql(
+        query, variables, permissions=[permission_manage_pages]
+    )
+
+    # then
+    content = get_graphql_content(response)
+    data = content["data"]["pageUpdate"]
+
+    assert not data["errors"]
+    assert data["page"]
+    updated_attribute = {
+        "attribute": {"slug": page_type_variant_reference_attribute.slug},
+        "values": [
+            {
+                "slug": attr_value.slug,
+                "file": None,
+                "name": page.title,
+                "reference": reference,
+                "plainText": None,
+            }
+        ],
+    }
+    assert updated_attribute in data["page"]["attributes"]
+
+    page_type_variant_reference_attribute.refresh_from_db()
+    assert page_type_variant_reference_attribute.values.count() == values_count
 
 
 @freeze_time("2020-03-18 12:00:00")
@@ -621,7 +951,38 @@ def test_public_page_sets_publication_date(
 
     assert not data["errors"]
     assert data["page"]["isPublished"] is True
-    assert data["page"]["publicationDate"] == "2020-03-18"
+    assert (
+        data["page"]["publishedAt"]
+        == datetime.datetime.now(tz=datetime.UTC).isoformat()
+    )
+
+
+def test_update_page_publication_date(
+    staff_api_client, permission_manage_pages, page_type
+):
+    data = {
+        "slug": "test-url",
+        "title": "Test page",
+        "page_type": page_type,
+    }
+    page = Page.objects.create(**data)
+    published_at = datetime.datetime.now(tz=datetime.UTC).replace(
+        microsecond=0
+    ) + datetime.timedelta(days=5)
+    page_id = graphene.Node.to_global_id("Page", page.id)
+    variables = {
+        "id": page_id,
+        "input": {"isPublished": True, "slug": page.slug, "publishedAt": published_at},
+    }
+    response = staff_api_client.post_graphql(
+        UPDATE_PAGE_MUTATION, variables, permissions=[permission_manage_pages]
+    )
+    content = get_graphql_content(response)
+    data = content["data"]["pageUpdate"]
+
+    assert not data["errors"]
+    assert data["page"]["isPublished"] is True
+    assert data["page"]["publishedAt"] == published_at.isoformat()
 
 
 @pytest.mark.parametrize("slug_value", [None, ""])
@@ -747,14 +1108,19 @@ def test_update_page_change_attribute_values_ordering(
 
     associate_attribute_values_to_instance(
         page,
-        page_type_product_reference_attribute,
-        attr_value_3,
-        attr_value_2,
-        attr_value_1,
+        {
+            page_type_product_reference_attribute.pk: [
+                attr_value_3,
+                attr_value_2,
+                attr_value_1,
+            ]
+        },
     )
 
+    attribute = get_page_attributes(page).first()
+    assert attribute is not None
     assert list(
-        page.attributes.first().pagevalueassignment.values_list("value_id", flat=True)
+        get_page_attribute_values(page, attribute).values_list("id", flat=True)
     ) == [attr_value_3.pk, attr_value_2.pk, attr_value_1.pk]
 
     new_ref_order = [product_list[1], product_list[0], product_list[2]]
@@ -794,9 +1160,9 @@ def test_update_page_change_attribute_values_ordering(
         graphene.Node.to_global_id("AttributeValue", val.pk)
         for val in [attr_value_2, attr_value_1, attr_value_3]
     ]
-    page.refresh_from_db()
+
     assert list(
-        page.attributes.first().pagevalueassignment.values_list("value_id", flat=True)
+        get_page_attribute_values(page, attribute).values_list("id", flat=True)
     ) == [attr_value_2.pk, attr_value_1.pk, attr_value_3.pk]
 
 

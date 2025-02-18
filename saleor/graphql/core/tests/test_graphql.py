@@ -1,24 +1,23 @@
 from functools import partial
-from unittest.mock import Mock, patch
+from unittest import mock
+from unittest.mock import Mock
 
 import graphene
 import pytest
-from django.contrib.auth.models import AnonymousUser
-from django.db.models import Q
-from django.shortcuts import reverse
+from django.urls import reverse
 from graphql.error import GraphQLError
 from graphql_relay import to_global_id
 
+from ....order import models as order_models
 from ...core.utils import from_global_id_or_error
+from ...order.types import Order
 from ...product.types import Product
 from ...tests.utils import get_graphql_content
 from ...utils import get_nodes
-from ...utils.filters import filter_by_query_param
 
 
 def test_middleware_dont_generate_sql_requests(client, settings, assert_num_queries):
-    """When requesting on the GraphQL API endpoint, no SQL request should happen
-    indirectly. This test ensures that."""
+    """Test that a GET request results in no database queries."""
 
     # Enables the Graphql playground
     settings.DEBUG = True
@@ -52,7 +51,7 @@ def test_jwt_middleware(client, admin_user):
     response = api_client_post(data={"query": user_details_query})
     repl_data = response.json()
     assert response.status_code == 200
-    assert isinstance(response.wsgi_request.user, AnonymousUser)
+    assert not response.wsgi_request.user
     assert repl_data["data"]["me"] is None
 
     # test creating a token for admin user
@@ -80,7 +79,7 @@ def test_real_query(user_api_client, product, channel_USD):
     attr_value = product_attr.values.first()
     query = """
     query Root($categoryId: ID!, $sortBy: ProductOrder, $first: Int,
-            $attributesFilter: [AttributeInput], $channel: String) {
+            $attributesFilter: [AttributeInput!], $channel: String) {
 
         category(id: $categoryId) {
             ...CategoryPageFragmentQuery
@@ -236,8 +235,9 @@ def test_get_nodes(product_list):
         nonexistent_item.type, nonexistent_item.pk
     )
     global_ids.append(nonexistent_item_global_id)
-    msg = "There is no node of type {} with pk {}".format(
-        nonexistent_item.type, nonexistent_item.pk
+    msg = (
+        f"There is no node of type {nonexistent_item.type} with "
+        f"pk {nonexistent_item.pk}"
     )
     with pytest.raises(AssertionError) as exc:
         get_nodes(global_ids, Product)
@@ -249,44 +249,86 @@ def test_get_nodes(product_list):
     invalid_item = Mock(type="test", pk=-1)
     invalid_item_global_id = to_global_id(invalid_item.type, invalid_item.pk)
     global_ids.append(invalid_item_global_id)
-    with pytest.raises(GraphQLError) as exc:
+    with pytest.raises(GraphQLError, match="Must receive Product id") as exc:
         get_nodes(global_ids, Product)
 
     assert exc.value.args == (f"Must receive Product id: {invalid_item_global_id}.",)
 
     # Raise an error if no nodes were found
     global_ids = []
-    msg = f"Could not resolve to a node with the global id list of '{global_ids}'."
-    with pytest.raises(Exception) as exc:
+    with pytest.raises(
+        GraphQLError, match="Could not resolve to a node with the global id list of"
+    ):
         get_nodes(global_ids, Product)
-
-    assert exc.value.args == (msg,)
 
     # Raise an error if pass wrong ids
     global_ids = ["a", "bb"]
-    msg = f"Could not resolve to a node with the global id list of '{global_ids}'."
-    with pytest.raises(Exception) as exc:
+    with pytest.raises(
+        GraphQLError, match="Could not resolve to a node with the global id list of"
+    ):
         get_nodes(global_ids, Product)
 
-    assert exc.value.args == (msg,)
+
+def test_get_nodes_for_order_with_int_id(order_list):
+    order_models.Order.objects.update(use_old_id=True)
+
+    # given
+    global_ids = [to_global_id("Order", order.number) for order in order_list]
+
+    # Make sure function works even if duplicated ids are provided
+    global_ids.append(to_global_id("Order", order_list[0].number))
+
+    # when
+    orders = get_nodes(global_ids, Order)
+
+    # then
+    assert orders == order_list
 
 
-@patch("saleor.product.models.Product.objects")
-def test_filter_by_query_param(qs):
-    qs.filter.return_value = qs
+def test_get_nodes_for_order_with_uuid_id(order_list):
+    # given
+    global_ids = [to_global_id("Order", order.pk) for order in order_list]
 
-    qs = filter_by_query_param(qs, "test", ["name", "force"])
-    test_kwargs = {"name__icontains": "test", "force__icontains": "test"}
-    q_objects = Q()
-    for q in test_kwargs:
-        q_objects |= Q(**{q: test_kwargs[q]})
-    # FIXME: django 1.11 fails on called_once_with(q_objects)
-    qs.filter.call_count == 1
+    # Make sure function works even if duplicated ids are provided
+    global_ids.append(to_global_id("Order", order_list[0].pk))
+
+    # when
+    orders = get_nodes(global_ids, Order)
+
+    # then
+    assert orders == order_list
+
+
+def test_get_nodes_for_order_with_int_id_and_use_old_id_set_to_false(order_list):
+    """Test that `get_node` respects `use_old_id`."""
+    # given
+    global_ids = [to_global_id("Order", order.number) for order in order_list]
+
+    # Make sure function works even if duplicated ids are provided
+    global_ids.append(to_global_id("Order", order_list[0].pk))
+
+    # when
+    with pytest.raises(AssertionError):
+        get_nodes(global_ids, Order)
+
+
+def test_get_nodes_for_order_with_uuid_and_int_id(order_list):
+    """Test that `get_nodes` works for both old and new order IDs."""
+    # given
+    order_models.Order.objects.update(use_old_id=True)
+    global_ids = [to_global_id("Order", order.pk) for order in order_list[:-1]]
+    global_ids.append(to_global_id("Order", order_list[-1].number))
+
+    # when
+    orders = get_nodes(global_ids, Order)
+
+    # then
+    assert orders == order_list
 
 
 def test_from_global_id_or_error(product):
     invalid_id = "invalid"
-    message = f"Couldn't resolve id: {invalid_id}."
+    message = f"Invalid ID: {invalid_id}."
 
     with pytest.raises(GraphQLError) as error:
         from_global_id_or_error(invalid_id)
@@ -296,7 +338,7 @@ def test_from_global_id_or_error(product):
 
 def test_from_global_id_or_error_wth_invalid_type(product):
     product_id = graphene.Node.to_global_id("Product", product.id)
-    message = "Must receive a ProductVariant id."
+    message = f"Invalid ID: {product_id}. Expected: ProductVariant, received: Product."
 
     with pytest.raises(GraphQLError) as error:
         from_global_id_or_error(product_id, "ProductVariant", raise_error=True)
@@ -314,3 +356,27 @@ def test_from_global_id_or_error_wth_type(product):
 
     assert product_id == str(product.id)
     assert product_type == expected_product_type
+
+
+@mock.patch("saleor.graphql.order.schema.create_connection_slice")
+def test_query_allow_replica(
+    mocked_resolver, staff_api_client, order, permission_manage_orders
+):
+    # given
+    query = """
+        query {
+          orders(first: 5){
+            edges {
+              node {
+                id
+              }
+            }
+          }
+        }
+    """
+
+    # when
+    staff_api_client.post_graphql(query, permissions=[permission_manage_orders])
+
+    # then
+    assert mocked_resolver.call_args[0][1].context.allow_replica

@@ -1,6 +1,8 @@
+import datetime
 from collections import defaultdict
-from datetime import date
-from typing import TYPE_CHECKING, Iterable, Optional
+from collections.abc import Iterable
+from typing import TYPE_CHECKING, Optional
+from uuid import UUID
 
 from dateutil.relativedelta import relativedelta
 from django.core.exceptions import ValidationError
@@ -10,10 +12,11 @@ from django.utils import timezone
 
 from ..checkout.error_codes import CheckoutErrorCode
 from ..checkout.models import Checkout
+from ..core.exceptions import GiftCardNotApplicable
 from ..core.tracing import traced_atomic_transaction
+from ..core.utils.events import call_event
 from ..core.utils.promo_code import InvalidPromoCode, generate_promo_code
-from ..core.utils.validators import user_is_valid
-from ..order.actions import create_fulfillments
+from ..order.actions import OrderFulfillmentLineInfo, create_fulfillments
 from ..order.models import OrderLine
 from ..site import GiftCardSettingsExpiryType
 from . import GiftCardEvents, GiftCardLineData, events
@@ -35,33 +38,36 @@ def add_gift_card_code_to_checkout(
 ):
     """Add gift card data to checkout by code.
 
+    Raise ValidationError if email is not provided.
     Raise InvalidPromoCode if gift card cannot be applied.
     """
     try:
         # only active gift card with currency the same as channel currency can be used
         gift_card = (
-            GiftCard.objects.active(date=date.today())
+            GiftCard.objects.active(date=datetime.datetime.now(tz=datetime.UTC).date())
             .filter(currency=currency)
             .get(code=promo_code)
         )
-    except GiftCard.DoesNotExist:
-        raise InvalidPromoCode()
-
-    used_by_email = gift_card.used_by_email
-    # gift card can be used only by one user
-    if used_by_email and used_by_email != email:
-        raise InvalidPromoCode()
+    except GiftCard.DoesNotExist as e:
+        raise InvalidPromoCode() from e
 
     checkout.gift_cards.add(gift_card)
     checkout.save(update_fields=["last_change"])
 
 
-def remove_gift_card_code_from_checkout(checkout: Checkout, gift_card_code: str):
-    """Remove gift card data from checkout by code."""
-    gift_card = checkout.gift_cards.filter(code=gift_card_code).first()
-    if gift_card:
+def remove_gift_card_code_from_checkout_or_error(
+    checkout: Checkout, gift_card_code: str
+) -> None:
+    """Remove gift card data from checkout by code or raise an error."""
+
+    if gift_card := checkout.gift_cards.filter(code=gift_card_code).first():
         checkout.gift_cards.remove(gift_card)
         checkout.save(update_fields=["last_change"])
+    else:
+        raise ValidationError(
+            "Cannot remove a gift card not attached to this checkout.",
+            code=CheckoutErrorCode.INVALID.value,
+        )
 
 
 def deactivate_gift_card(gift_card: GiftCard):
@@ -86,8 +92,6 @@ def fulfill_non_shippable_gift_cards(
     app: Optional["App"],
     manager: "PluginsManager",
 ):
-    if not user_is_valid(requestor_user):
-        requestor_user = None
     gift_card_lines = get_non_shippable_gift_card_lines(order_lines)
     if not gift_card_lines:
         return
@@ -117,7 +121,9 @@ def fulfill_gift_card_lines(
     settings: "SiteSettings",
     manager: "PluginsManager",
 ):
-    lines_for_warehouses = defaultdict(list)
+    lines_for_warehouses: defaultdict[UUID, list[OrderFulfillmentLineInfo]] = (
+        defaultdict(list)
+    )
     channel_slug = order.channel.slug
     for line in gift_card_lines.prefetch_related(
         "allocations__stock", "variant__stocks"
@@ -126,18 +132,17 @@ def fulfill_gift_card_lines(
             for allocation in allocations:
                 quantity = allocation.quantity_allocated
                 if quantity > 0:
-                    warehouse_pk = str(allocation.stock.warehouse_id)
+                    warehouse_pk = allocation.stock.warehouse_id
                     lines_for_warehouses[warehouse_pk].append(
                         {"order_line": line, "quantity": quantity}
                     )
         else:
-            stock = line.variant.stocks.for_channel(channel_slug).first()
+            stock = line.variant.stocks.for_channel_and_country(channel_slug).first()
             if not stock:
-                raise ValidationError(
-                    "Lack of gift card stock for checkout channel.",
-                    code=CheckoutErrorCode.GIFT_CARD_NOT_APPLICABLE.value,
+                raise GiftCardNotApplicable(
+                    message="Lack of gift card stock for checkout channel.",
                 )
-            warehouse_pk = str(stock.warehouse_id)
+            warehouse_pk = stock.warehouse_id
             lines_for_warehouses[warehouse_pk].append(
                 {"order_line": line, "quantity": line.quantity}
             )
@@ -150,13 +155,14 @@ def fulfill_gift_card_lines(
         manager,
         settings,
         notify_customer=True,
+        auto=True,
     )
 
 
 @traced_atomic_transaction()
 def gift_cards_create(
     order: "Order",
-    gift_card_lines_info: Iterable["GiftCardLineData"],
+    gift_card_lines_info: list["GiftCardLineData"],
     settings: "SiteSettings",
     requestor_user: Optional["User"],
     app: Optional["App"],
@@ -172,10 +178,10 @@ def gift_cards_create(
         order_line = line_data.order_line
         price = order_line.unit_price_gross
         line_gift_cards = [
-            GiftCard(  # type: ignore
+            GiftCard(  # type: ignore[misc] # see below:
                 code=generate_promo_code(),
-                initial_balance=price,
-                current_balance=price,
+                initial_balance=price,  # money field not supported by mypy_django_plugin # noqa: E501
+                current_balance=price,  # money field not supported by mypy_django_plugin # noqa: E501
                 created_by=customer_user,
                 created_by_email=user_email,
                 product=line_data.variant.product if line_data.variant else None,
@@ -189,7 +195,10 @@ def gift_cards_create(
             non_shippable_gift_cards.extend(line_gift_cards)
 
     gift_cards = GiftCard.objects.bulk_create(gift_cards)
-    events.gift_cards_bought_event(gift_cards, order.id, requestor_user, app)
+    events.gift_cards_bought_event(gift_cards, order, requestor_user, app)
+
+    for gift_card in gift_cards:
+        call_event(manager.gift_card_created, gift_card)
 
     channel_slug = order.channel.slug
     # send to customer all non-shippable gift cards
@@ -214,7 +223,7 @@ def calculate_expiry_date(settings):
     if settings.gift_card_expiry_type == GiftCardSettingsExpiryType.EXPIRY_PERIOD:
         expiry_period_type = settings.gift_card_expiry_period_type
         time_delta = {f"{expiry_period_type}s": settings.gift_card_expiry_period}
-        expiry_date = today + relativedelta(**time_delta)  # type: ignore
+        expiry_date = today + relativedelta(**time_delta)
     return expiry_date
 
 
@@ -241,10 +250,10 @@ def send_gift_cards_to_customer(
 
 
 def deactivate_order_gift_cards(
-    order_id: int, user: Optional["User"], app: Optional["App"]
+    order_id: UUID, user: Optional["User"], app: Optional["App"]
 ):
     gift_card_events = GiftCardEvent.objects.filter(
-        type=GiftCardEvents.BOUGHT, parameters__order_id=order_id
+        type=GiftCardEvents.BOUGHT, order_id=order_id
     )
     gift_cards = GiftCard.objects.filter(
         Exists(gift_card_events.filter(gift_card_id=OuterRef("id")))
@@ -267,4 +276,15 @@ def assign_user_gift_cards(user):
 def is_gift_card_expired(gift_card: GiftCard):
     """Return True when gift card expiry date pass."""
     today = timezone.now().date()
-    return bool(gift_card.expiry_date) and gift_card.expiry_date < today  # type: ignore
+    return bool(gift_card.expiry_date) and gift_card.expiry_date < today  # type: ignore[operator]
+
+
+def get_user_gift_cards(user: "User") -> "QuerySet":
+    from django.db.models import Q
+
+    return GiftCard.objects.filter(
+        Q(used_by_email=user.email)
+        | Q(created_by_email=user.email)
+        | Q(used_by=user)
+        | Q(created_by=user)
+    )

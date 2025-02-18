@@ -4,7 +4,6 @@ from django.db import migrations, models
 
 
 class Migration(migrations.Migration):
-
     dependencies = [
         ("order", "0120_orderline_optional_sku"),
     ]
@@ -19,6 +18,7 @@ class Migration(migrations.Migration):
             model_name="order",
             name="order_order_user_em_bda05b_gin",
         ),
+        # nosemgrep: add-index-concurrently
         migrations.AddIndex(
             model_name="order",
             index=django.contrib.postgres.indexes.GinIndex(
@@ -27,6 +27,7 @@ class Migration(migrations.Migration):
                 opclasses=["gin_trgm_ops"],
             ),
         ),
+        # nosemgrep: add-index-concurrently
         migrations.AddIndex(
             model_name="order",
             index=django.contrib.postgres.indexes.GinIndex(

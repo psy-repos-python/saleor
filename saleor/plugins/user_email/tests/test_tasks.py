@@ -3,6 +3,7 @@ from unittest import mock
 from ....account.notifications import get_default_user_payload
 from ....giftcard import GiftCardEvents
 from ....giftcard.models import GiftCardEvent
+from ....graphql.core.utils import to_global_id_or_none
 from ....invoice import InvoiceEvents
 from ....invoice.models import Invoice, InvoiceEvent
 from ....order import OrderEvents, OrderEventsEmails
@@ -220,9 +221,12 @@ def test_send_request_email_change_email_task_custom_template(
     )
 
 
+@mock.patch(
+    "saleor.plugins.user_email.tasks.account_events.customer_email_changed_event"
+)
 @mock.patch("saleor.plugins.email_common.send_mail")
 def test_send_user_change_email_notification_task_default_template(
-    mocked_send_mail, user_email_dict_config, customer_user
+    mocked_send_mail, mocked_email_changed_task, user_email_dict_config, customer_user
 ):
     recipient_email = "user@example.com"
     payload = {
@@ -237,9 +241,16 @@ def test_send_user_change_email_notification_task_default_template(
     send_user_change_email_notification_task(
         recipient_email, payload, user_email_dict_config, "subject", "template"
     )
-
+    expected_task_payload = {
+        "old_email": payload["old_email"],
+        "new_email": payload["new_email"],
+    }
     # confirm that mail has correct structure and email was sent
     assert mocked_send_mail.called
+    # confirm that email changed task was triggered
+    mocked_email_changed_task.assert_called_once_with(
+        user_id=str(customer_user.id), parameters=expected_task_payload
+    )
 
 
 @mock.patch("saleor.plugins.user_email.tasks.send_email")
@@ -415,15 +426,15 @@ def test_send_invoice_email_task_default_template_by_user(
     recipient_email = "user@example.com"
     payload = {
         "invoice": {
-            "id": invoice.id,
-            "order_id": order.id,
+            "id": to_global_id_or_none(invoice),
+            "order_id": to_global_id_or_none(order),
             "number": 999,
             "download_url": "http://localhost:8000/download",
         },
         "recipient_email": recipient_email,
         "site_name": "Saleor",
         "domain": "localhost:8000",
-        "requester_user_id": staff_user.id,
+        "requester_user_id": to_global_id_or_none(staff_user),
         "requester_app_id": None,
     }
 
@@ -458,8 +469,8 @@ def test_send_invoice_email_task_default_template_by_app(
     recipient_email = "user@example.com"
     payload = {
         "invoice": {
-            "id": invoice.id,
-            "order_id": order.id,
+            "id": to_global_id_or_none(invoice),
+            "order_id": to_global_id_or_none(order),
             "number": 999,
             "download_url": "http://localhost:8000/download",
         },
@@ -467,7 +478,7 @@ def test_send_invoice_email_task_default_template_by_app(
         "site_name": "Saleor",
         "domain": "localhost:8000",
         "requester_user_id": None,
-        "requester_app_id": app.pk,
+        "requester_app_id": to_global_id_or_none(app),
     }
 
     send_invoice_email_task(
@@ -504,15 +515,15 @@ def test_send_invoice_email_task_custom_template(
     recipient_email = "user@example.com"
     payload = {
         "invoice": {
-            "id": invoice.id,
+            "id": to_global_id_or_none(invoice),
             "number": 999,
-            "order_id": order.id,
+            "order_id": to_global_id_or_none(order),
             "download_url": "http://localhost:8000/download",
         },
         "recipient_email": recipient_email,
         "site_name": "Saleor",
         "domain": "localhost:8000",
-        "requester_user_id": staff_user.id,
+        "requester_user_id": to_global_id_or_none(staff_user),
         "requester_app_id": None,
     }
 
@@ -607,7 +618,7 @@ def test_send_fulfillment_confirmation_email_task_default_template(
     mocked_send_mail, user_email_dict_config, order, fulfillment, staff_user
 ):
     payload = get_default_fulfillment_payload(order, fulfillment)
-    payload["requester_user_id"] = staff_user.pk
+    payload["requester_user_id"] = to_global_id_or_none(staff_user)
     payload["requester_app_id"] = None
 
     send_fulfillment_confirmation_email_task(
@@ -645,7 +656,7 @@ def test_send_fulfillment_confirmation_email_task_custom_template_by_user(
         fulfillment_confirmation_subject=expected_subject,
     )
     payload = get_default_fulfillment_payload(order, fulfillment)
-    payload["requester_user_id"] = staff_user.pk
+    payload["requester_user_id"] = to_global_id_or_none(staff_user)
     payload["requester_app_id"] = None
     payload["digital_lines"] = [{"fulfillmentLine": {"id": 1}}]
     recipient_email = payload["recipient_email"]
@@ -699,7 +710,7 @@ def test_send_fulfillment_confirmation_email_task_custom_template_by_app(
     )
     payload = get_default_fulfillment_payload(order, fulfillment)
     payload["requester_user_id"] = None
-    payload["requester_app_id"] = app.pk
+    payload["requester_app_id"] = to_global_id_or_none(app)
     payload["digital_lines"] = [{"fulfillmentLine": {"id": 1}}]
     recipient_email = payload["recipient_email"]
 
@@ -797,8 +808,8 @@ def test_send_payment_confirmation_email_task_default_template(
         "order": get_default_order_payload(order, "http://localhost:8000/redirect"),
         "recipient_email": recipient_email,
         "payment": {
-            "created": payment_dummy.created,
-            "modified": payment_dummy.modified,
+            "created": payment_dummy.created_at,
+            "modified": payment_dummy.modified_at,
             "charge_status": payment_dummy.charge_status,
             "total": payment_dummy.total,
             "captured_amount": payment_dummy.captured_amount,
@@ -837,8 +848,8 @@ def test_send_payment_confirmation_email_task_custom_template(
         "order": get_default_order_payload(order, "http://localhost:8000/redirect"),
         "recipient_email": recipient_email,
         "payment": {
-            "created": payment_dummy.created,
-            "modified": payment_dummy.modified,
+            "created": payment_dummy.created_at,
+            "modified": payment_dummy.modified_at,
             "charge_status": payment_dummy.charge_status,
             "total": payment_dummy.total,
             "captured_amount": payment_dummy.captured_amount,
@@ -875,7 +886,7 @@ def test_send_order_canceled_email_task_default_template_by_user(
         "recipient_email": recipient_email,
         "site_name": "Saleor",
         "domain": "localhost:8000",
-        "requester_user_id": staff_user.pk,
+        "requester_user_id": to_global_id_or_none(staff_user),
         "requester_app_id": None,
     }
 
@@ -898,7 +909,7 @@ def test_send_order_canceled_email_task_default_template_by_app(
         "site_name": "Saleor",
         "domain": "localhost:8000",
         "requester_user_id": None,
-        "requester_app_id": app.pk,
+        "requester_app_id": to_global_id_or_none(app),
     }
 
     send_order_canceled_email_task(
@@ -925,7 +936,7 @@ def test_send_order_canceled_email_task_custom_template(
         "recipient_email": recipient_email,
         "site_name": "Saleor",
         "domain": "localhost:8000",
-        "requester_user_id": staff_user.pk,
+        "requester_user_id": to_global_id_or_none(staff_user),
         "requester_app_id": None,
     }
     send_order_canceled_email_task(
@@ -958,7 +969,7 @@ def test_send_order_refund_email_task_default_template_by_user(
         "currency": order.currency,
         "site_name": "Saleor",
         "domain": "localhost:8000",
-        "requester_user_id": staff_user.pk,
+        "requester_user_id": to_global_id_or_none(staff_user),
         "requester_app_id": None,
     }
 
@@ -989,7 +1000,7 @@ def test_send_order_refund_email_task_default_template_by_app(
         "site_name": "Saleor",
         "domain": "localhost:8000",
         "requester_user_id": None,
-        "requester_app_id": app.pk,
+        "requester_app_id": to_global_id_or_none(app),
     }
 
     send_order_refund_email_task(
@@ -1024,7 +1035,7 @@ def test_send_order_refund_email_task_custom_template(
         "currency": order.currency,
         "site_name": "Saleor",
         "domain": "localhost:8000",
-        "requester_user_id": staff_user.pk,
+        "requester_user_id": to_global_id_or_none(staff_user),
         "requester_app_id": None,
     }
     send_order_refund_email_task(
@@ -1058,7 +1069,7 @@ def test_send_order_confirmed_email_task_default_template_by_user(
     payload = {
         "order": get_default_order_payload(order, "http://localhost:8000/redirect"),
         "recipient_email": recipient_email,
-        "requester_user_id": staff_user.id,
+        "requester_user_id": to_global_id_or_none(staff_user),
         "requester_app_id": None,
         "site_name": "Saleor",
         "domain": "localhost:8000",
@@ -1088,7 +1099,7 @@ def test_send_order_confirmed_email_task_default_template_by_app(
     payload = {
         "order": get_default_order_payload(order, "http://localhost:8000/redirect"),
         "recipient_email": recipient_email,
-        "requester_app_id": app.id,
+        "requester_app_id": to_global_id_or_none(app),
         "requester_user_id": None,
         "site_name": "Saleor",
         "domain": "localhost:8000",
@@ -1124,7 +1135,7 @@ def test_send_order_confirmed_email_task_custom_template(
     payload = {
         "order": get_default_order_payload(order, "http://localhost:8000/redirect"),
         "recipient_email": recipient_email,
-        "requester_user_id": staff_user.id,
+        "requester_user_id": to_global_id_or_none(staff_user),
         "requester_app_id": None,
         "site_name": "Saleor",
         "domain": "localhost:8000",
@@ -1165,13 +1176,12 @@ def test_send_gift_card_email_task_by_user(
 
     payload = {
         "user": get_default_user_payload(staff_user),
-        "requester_user_id": staff_user.id,
+        "requester_user_id": to_global_id_or_none(staff_user),
         "requester_app_id": None,
         "recipient_email": recipient_email,
         "resending": False,
-        "recipient_email": recipient_email,
         "gift_card": {
-            "id": gift_card.id,
+            "id": to_global_id_or_none(gift_card),
             "code": gift_card.code,
             "balance": gift_card.current_balance_amount,
             "currency": gift_card.currency,
@@ -1219,13 +1229,12 @@ def test_send_gift_card_email_task_by_user_resending(
 
     payload = {
         "user": get_default_user_payload(staff_user),
-        "requester_user_id": staff_user.id,
+        "requester_user_id": to_global_id_or_none(staff_user),
         "requester_app_id": None,
         "recipient_email": recipient_email,
         "resending": True,
-        "recipient_email": recipient_email,
         "gift_card": {
-            "id": gift_card.id,
+            "id": to_global_id_or_none(gift_card),
             "code": gift_card.code,
             "balance": gift_card.current_balance_amount,
             "currency": gift_card.currency,
@@ -1273,17 +1282,15 @@ def test_send_gift_card_email_task_by_app(
     payload = {
         "user": None,
         "requester_user_id": None,
-        "requester_app_id": app.id,
+        "requester_app_id": to_global_id_or_none(app),
         "recipient_email": recipient_email,
         "resending": False,
-        "recipient_email": recipient_email,
         "gift_card": {
-            "id": gift_card.id,
+            "id": to_global_id_or_none(gift_card),
             "code": gift_card.code,
             "balance": gift_card.current_balance_amount,
             "currency": gift_card.currency,
         },
-        "recipient_email": recipient_email,
     }
 
     user_email_plugin(

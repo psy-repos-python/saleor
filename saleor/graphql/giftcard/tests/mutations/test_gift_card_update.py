@@ -1,11 +1,18 @@
-from datetime import date, timedelta
+import datetime
+import json
+from unittest import mock
 
 import graphene
 import pytest
+from django.utils.functional import SimpleLazyObject
+from freezegun import freeze_time
 
+from .....core.utils.json_serializer import CustomJsonEncoder
 from .....giftcard import GiftCardEvents
 from .....giftcard.error_codes import GiftCardErrorCode
 from .....giftcard.models import GiftCardTag
+from .....webhook.event_types import WebhookEventAsyncType
+from .....webhook.payloads import generate_meta, generate_requestor
 from ....tests.utils import assert_no_permission, get_graphql_content
 
 UPDATE_GIFT_CARD_MUTATION = """
@@ -100,7 +107,9 @@ def test_update_gift_card(
 
     initial_balance = 100.0
     currency = gift_card.currency
-    date_value = date.today() + timedelta(days=365)
+    date_value = datetime.datetime.now(tz=datetime.UTC).date() + datetime.timedelta(
+        days=365
+    )
     old_tag = gift_card.tags.first().name
     new_tag = "new-gift-card-tag"
     tags_count = GiftCardTag.objects.count()
@@ -221,7 +230,9 @@ def test_update_gift_card_by_app(
 
     initial_balance = 100.0
     currency = gift_card.currency
-    date_value = date.today() + timedelta(days=365)
+    date_value = datetime.datetime.now(tz=datetime.UTC).date() + datetime.timedelta(
+        days=365
+    )
     new_tag = gift_card_tag_list[0].name
     tags_count = GiftCardTag.objects.count()
     variables = {
@@ -489,7 +500,9 @@ def test_update_used_gift_card_to_expiry_date(
 ):
     # given
     gift_card = gift_card_used
-    date_value = date.today() + timedelta(days=365)
+    date_value = datetime.datetime.now(tz=datetime.UTC).date() + datetime.timedelta(
+        days=365
+    )
 
     variables = {
         "id": graphene.Node.to_global_id("GiftCard", gift_card.pk),
@@ -569,7 +582,9 @@ def test_update_gift_card_date_in_past(
     permission_manage_apps,
 ):
     # given
-    date_value = date.today() - timedelta(days=365)
+    date_value = datetime.datetime.now(tz=datetime.UTC).date() - datetime.timedelta(
+        days=365
+    )
     variables = {
         "id": graphene.Node.to_global_id("GiftCard", gift_card.pk),
         "input": {
@@ -607,7 +622,9 @@ def test_update_gift_card_expired_card(
     permission_manage_apps,
 ):
     # given
-    gift_card.expiry_date = date.today() - timedelta(days=1)
+    gift_card.expiry_date = datetime.datetime.now(
+        tz=datetime.UTC
+    ).date() - datetime.timedelta(days=1)
     gift_card.save(update_fields=["expiry_date"])
 
     variables = {
@@ -725,3 +742,75 @@ def test_update_gift_card_duplicated_tags_item(
     assert len(errors) == 1
     assert errors[0]["field"] == "tags"
     assert errors[0]["code"] == GiftCardErrorCode.DUPLICATED_INPUT_ITEM.name
+
+
+@freeze_time("2022-05-12 12:00:00")
+@mock.patch("saleor.plugins.webhook.plugin.get_webhooks_for_event")
+@mock.patch("saleor.plugins.webhook.plugin.trigger_webhooks_async")
+def test_update_gift_card_trigger_webhook(
+    mocked_webhook_trigger,
+    mocked_get_webhooks_for_event,
+    any_webhook,
+    staff_api_client,
+    gift_card,
+    permission_manage_gift_card,
+    permission_manage_users,
+    permission_manage_apps,
+    settings,
+):
+    # given
+    mocked_get_webhooks_for_event.return_value = [any_webhook]
+    settings.PLUGINS = ["saleor.plugins.webhook.plugin.WebhookPlugin"]
+
+    initial_balance = 100.0
+    date_value = datetime.datetime.now(tz=datetime.UTC).date() + datetime.timedelta(
+        days=365
+    )
+    new_tag = "new-gift-card-tag"
+    variables = {
+        "id": graphene.Node.to_global_id("GiftCard", gift_card.pk),
+        "input": {
+            "balanceAmount": initial_balance,
+            "addTags": [new_tag],
+            "expiryDate": date_value,
+        },
+    }
+
+    # when
+    response = staff_api_client.post_graphql(
+        UPDATE_GIFT_CARD_MUTATION,
+        variables,
+        permissions=[
+            permission_manage_gift_card,
+            permission_manage_users,
+            permission_manage_apps,
+        ],
+    )
+
+    # then
+    content = get_graphql_content(response)
+    errors = content["data"]["giftCardUpdate"]["errors"]
+    data = content["data"]["giftCardUpdate"]["giftCard"]
+
+    assert not errors
+    assert data
+
+    mocked_webhook_trigger.assert_called_once_with(
+        json.dumps(
+            {
+                "id": graphene.Node.to_global_id("GiftCard", gift_card.id),
+                "is_active": gift_card.is_active,
+                "meta": generate_meta(
+                    requestor_data=generate_requestor(
+                        SimpleLazyObject(lambda: staff_api_client.user)
+                    )
+                ),
+            },
+            cls=CustomJsonEncoder,
+        ),
+        WebhookEventAsyncType.GIFT_CARD_UPDATED,
+        [any_webhook],
+        gift_card,
+        SimpleLazyObject(lambda: staff_api_client.user),
+        allow_replica=False,
+    )

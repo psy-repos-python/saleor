@@ -114,6 +114,12 @@ COST_MAP = {
         "staffUsers": {"complexity": 1, "multipliers": ["first", "last"]},
         "stock": {"complexity": 1},
         "stocks": {"complexity": 1, "multipliers": ["first", "last"]},
+        "taxClass": {"complexity": 1},
+        "taxClasses": {"complexity": 1, "multipliers": ["first", "last"]},
+        "taxConfiguration": {"complexity": 1},
+        "taxConfigurations": {"complexity": 1, "multipliers": ["first", "last"]},
+        "taxCountryConfiguration": {"complexity": 1},
+        "taxCountryConfigurations": {"complexity": 1},
         "taxTypes": {"complexity": 1},
         "translation": {"complexity": 1},
         "translations": {"complexity": 1, "multipliers": ["first", "last"]},
@@ -123,6 +129,14 @@ COST_MAP = {
         "warehouse": {"complexity": 1},
         "warehouses": {"complexity": 1, "multipliers": ["first", "last"]},
         "webhook": {"complexity": 1},
+    },
+    "Allocation": {
+        "warehouse": {"complexity": 1},
+    },
+    "App": {
+        "extensions": {"complexity": 1},
+        "tokens": {"complexity": 1},
+        "webhooks": {"complexity": 1},
     },
     "Attribute": {
         "choices": {"complexity": 1, "multipliers": ["first", "last"]},
@@ -136,12 +150,96 @@ COST_MAP = {
         "parent": {"complexity": 1},
         "products": {"complexity": 1, "multipliers": ["first", "last"]},
     },
+    "Checkout": {
+        "availableCollectionPoints": {"complexity": 1},
+        "availablePaymentGateways": {"complexity": 1},
+        "availableShippingMethods": {"complexity": 1},
+        "billingAddress": {"complexity": 1},
+        "channel": {"complexity": 1},
+        "giftCards": {"complexity": 1},
+        "lines": {"complexity": 1},
+        "shippingAddress": {"complexity": 1},
+        "shippingMethod": {"complexity": 1},
+        "shippingMethods": {"complexity": 1},
+        "transactions": {"complexity": 1},
+        "user": {"complexity": 1},
+    },
     "Collection": {
         "channelListings": {"complexity": 1},
         "products": {"complexity": 1, "multipliers": ["first", "last"]},
     },
+    "CollectionChannelListing": {
+        "channel": {"complexity": 1},
+    },
+    "Fulfillment": {
+        "lines": {"complexity": 1},
+        "warehouse": {"complexity": 1},
+    },
+    "FulfillmentLine": {
+        "orderLine": {"complexity": 1},
+    },
+    "GiftCard": {
+        "app": {"complexity": 1},
+        "createdBy": {"complexity": 1},
+        "events": {"complexity": 1},
+        "product": {"complexity": 1},
+        "usedBy": {"complexity": 1},
+        "user": {"complexity": 1},
+    },
+    "Group": {
+        "permissions": {"complexity": 1},
+        "users": {"complexity": 1},
+    },
+    "Invoice": {
+        "order": {"complexity": 1},
+    },
+    "Menu": {
+        "items": {"complexity": 1},
+    },
+    "MenuItem": {
+        "category": {"complexity": 1},
+        "children": {"complexity": 1},
+        "collection": {"complexity": 1},
+        "menu": {"complexity": 1},
+        "page": {"complexity": 1},
+        "parent": {"complexity": 1},
+    },
+    "Order": {
+        "availableCollectionPoints": {"complexity": 1},
+        "availableShippingMethods": {"complexity": 1},
+        "billingAddress": {"complexity": 1},
+        "channel": {"complexity": 1},
+        "deliveryMethod": {"complexity": 1},
+        "discounts": {"complexity": 1},
+        "events": {"complexity": 1},
+        "fulfillments": {"complexity": 1},
+        "giftCards": {"complexity": 1},
+        "invoices": {"complexity": 10},
+        "lines": {"complexity": 1},
+        "payments": {"complexity": 1},
+        "shippingAddress": {"complexity": 1},
+        "shippingMethod": {"complexity": 1},
+        "shippingMethods": {"complexity": 1},
+        "transactions": {"complexity": 1},
+        "user": {"complexity": 1},
+        "voucher": {"complexity": 1},
+    },
     "OrderLine": {
+        "allocations": {"complexity": 1},
+        "thumbnail": {"complexity": 1},
         "variant": {"complexity": 1},
+    },
+    "Page": {
+        "attributes": {"complexity": 1},
+        "pageType": {"complexity": 1},
+    },
+    "PageType": {
+        "attributes": {"complexity": 1},
+        "availableAttributes": {"complexity": 1, "multipliers": ["first", "last"]},
+    },
+    "Payment": {
+        "order": {"complexity": 1},
+        "transactions": {"complexity": 1},
     },
     "Product": {
         "attributes": {"complexity": 1},
@@ -158,6 +256,22 @@ COST_MAP = {
         "productType": {"complexity": 1},
         "thumbnail": {"complexity": 1},
         "variants": {"complexity": 1},
+        "productVariants": {"complexity": 1, "multipliers": ["first", "last"]},
+    },
+    "ProductChannelListing": {
+        "channel": {"complexity": 1},
+        "pricing": {"complexity": 1},
+    },
+    "ProductImage": {
+        "url": {"complexity": 1},
+    },
+    "ProductMedia": {
+        "url": {"complexity": 1},
+    },
+    "ProductType": {
+        "availableAttributes": {"complexity": 1, "multipliers": ["first", "last"]},
+        "productAttributes": {"complexity": 1},
+        "products": {"complexity": 1, "multipliers": ["first", "last"]},
     },
     "ProductVariant": {
         "attributes": {"complexity": 1},
@@ -168,7 +282,74 @@ COST_MAP = {
         "product": {"complexity": 1},
         "revenue": {"complexity": 1},
     },
+    "ProductVariantChannelListing": {
+        "channel": {"complexity": 1},
+    },
+    "Sale": {
+        "categories": {"complexity": 1, "multipliers": ["first", "last"]},
+        "channelListings": {"complexity": 1},
+        "collections": {"complexity": 1, "multipliers": ["first", "last"]},
+        "products": {"complexity": 1, "multipliers": ["first", "last"]},
+        "translation": {"complexity": 1},
+        "variants": {"complexity": 1, "multipliers": ["first", "last"]},
+    },
+    "SaleChannelListing": {
+        "channel": {"complexity": 1},
+    },
     "SelectedAttribute": {
         "attribute": {"complexity": 1},
+        "values": {"complexity": 1, "multipliers": ["first", "last"]},
+    },
+    "ShippingMethodChannelListing": {
+        "channel": {"complexity": 1},
+    },
+    "ShippingZone": {
+        "channels": {"complexity": 1},
+        "countries": {"complexity": 1},
+        "warehouses": {"complexity": 1},
+    },
+    "Shop": {
+        "availableExternalAuthentications": {"complexity": 1},
+        "availablePaymentGateways": {"complexity": 1},
+        "availableShippingMethods": {"complexity": 1},
+        "countries": {"complexity": 1},
+    },
+    "Stock": {
+        "productVariant": {"complexity": 1},
+    },
+    "TaxClass": {
+        "countries": {"complexity": 1},
+    },
+    "TaxClassCountryRate": {
+        "taxClass": {"complexity": 1},
+    },
+    "TaxCountryConfiguration": {
+        "taxClassCountryRates": {"complexity": 1},
+    },
+    "TaxConfiguration": {
+        "channel": {"complexity": 1},
+        "countries": {"complexity": 1},
+    },
+    "User": {
+        "avatar": {"complexity": 1},
+        "checkout": {"complexity": 1},
+        "editableGroups": {"complexity": 1},
+        "events": {"complexity": 1},
+        "giftCards": {"complexity": 1, "multipliers": ["first", "last"]},
+        "orders": {"complexity": 1, "multipliers": ["first", "last"]},
+        "permissionGroups": {"complexity": 1},
+        "storedPaymentSources": {"complexity": 1},
+        "userPermissions": {"complexity": 1},
+    },
+    "Voucher": {
+        "categories": {"complexity": 1, "multipliers": ["first", "last"]},
+        "channelListings": {"complexity": 1},
+        "collections": {"complexity": 1, "multipliers": ["first", "last"]},
+        "countries": {"complexity": 1},
+        "products": {"complexity": 1, "multipliers": ["first", "last"]},
+        "variants": {"complexity": 1, "multipliers": ["first", "last"]},
+    },
+    "VoucherChannelListing": {
+        "channel": {"complexity": 1},
     },
 }

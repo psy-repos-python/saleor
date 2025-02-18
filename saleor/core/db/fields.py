@@ -1,7 +1,8 @@
 import json
-from typing import Callable
+from collections.abc import Callable
 
-from django.db.models import JSONField  # type: ignore
+from django.db.models import JSONField
+from django.db.models.expressions import Expression
 
 
 class SanitizedJSONField(JSONField):
@@ -9,7 +10,7 @@ class SanitizedJSONField(JSONField):
     "before saving into the database."
 
     def __init__(self, *args, sanitizer: Callable[[dict], dict], **kwargs):
-        super(SanitizedJSONField, self).__init__(*args, **kwargs)
+        super().__init__(*args, **kwargs)
         self._sanitizer_method = sanitizer
 
     def deconstruct(self):
@@ -19,4 +20,6 @@ class SanitizedJSONField(JSONField):
 
     def get_db_prep_save(self, value: dict, connection):
         """Sanitize the value for saving using the passed sanitizer."""
+        if isinstance(value, Expression):
+            return value
         return json.dumps(self._sanitizer_method(value))

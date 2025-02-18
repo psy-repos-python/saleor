@@ -1,21 +1,19 @@
+import json
 from unittest import mock
+from unittest.mock import patch
 
 import graphene
 import pytest
+from django.shortcuts import render
 from django.test import override_settings
 from graphql.execution.base import ExecutionResult
 
 from .... import __version__ as saleor_version
-from ....demo.views import EXAMPLE_QUERY
-from ...tests.fixtures import (
-    ACCESS_CONTROL_ALLOW_CREDENTIALS,
-    ACCESS_CONTROL_ALLOW_HEADERS,
-    ACCESS_CONTROL_ALLOW_METHODS,
-    ACCESS_CONTROL_ALLOW_ORIGIN,
-    API_PATH,
-)
+from ....graphql.api import backend, schema
+from ....graphql.utils import INTERNAL_ERROR_MESSAGE
+from ...tests.fixtures import API_PATH
 from ...tests.utils import get_graphql_content, get_graphql_content_from_response
-from ...views import generate_cache_key
+from ...views import GraphQLView, generate_cache_key
 
 
 def test_batch_queries(category, product, api_client, channel_USD):
@@ -83,97 +81,18 @@ def test_graphql_view_query_with_invalid_object_type(
     assert content["data"]["order"] is None
 
 
-@pytest.mark.parametrize("playground_on, status", [(True, 200), (False, 405)])
+@pytest.mark.parametrize(("playground_on", "status"), [(True, 200), (False, 405)])
 def test_graphql_view_get_enabled_or_disabled(client, settings, playground_on, status):
     settings.PLAYGROUND_ENABLED = playground_on
     response = client.get(API_PATH)
     assert response.status_code == status
 
 
-def test_graphql_view_options(client):
-    response = client.options(API_PATH)
-    assert response.status_code == 200
-
-
-@pytest.mark.parametrize("method", ("put", "patch", "delete"))
+@pytest.mark.parametrize("method", ["put", "patch", "delete"])
 def test_graphql_view_not_allowed(method, client):
     func = getattr(client, method)
     response = func(API_PATH)
     assert response.status_code == 405
-
-
-def test_graphql_view_access_control_header(client, settings):
-    settings.ALLOWED_GRAPHQL_ORIGINS = ["*"]
-    origin = "http://localhost:3000"
-    response = client.options(API_PATH, HTTP_ORIGIN=origin)
-    assert response[ACCESS_CONTROL_ALLOW_ORIGIN] == origin
-    assert response[ACCESS_CONTROL_ALLOW_CREDENTIALS] == "true"
-    assert response[ACCESS_CONTROL_ALLOW_METHODS] == "POST, OPTIONS"
-    assert (
-        response[ACCESS_CONTROL_ALLOW_HEADERS]
-        == "Origin, Content-Type, Accept, Authorization, Authorization-Bearer"
-    )
-
-    response = client.options(API_PATH)
-    assert all(
-        [
-            field not in response
-            for field in (
-                ACCESS_CONTROL_ALLOW_ORIGIN,
-                ACCESS_CONTROL_ALLOW_CREDENTIALS,
-                ACCESS_CONTROL_ALLOW_HEADERS,
-                ACCESS_CONTROL_ALLOW_METHODS,
-            )
-        ]
-    )
-
-
-@pytest.mark.parametrize(
-    "allowed_origins,allowed,not_allowed",
-    [
-        (
-            ["*"],
-            [
-                "http://example.org",
-                "https://example.org",
-                "http://localhost:3000",
-                "http://localhost:9000",
-                "file://",
-            ],
-            [],
-        ),
-        (
-            ["http://example.org"],
-            ["http://example.org"],
-            [
-                "https://example.org",
-                "http://localhost:3000",
-                "http://localhost:9000",
-                "file://",
-            ],
-        ),
-        (
-            ["http://example.org", "https://example.org"],
-            ["http://example.org", "https://example.org"],
-            ["http://localhost:3000", "http://localhost:9000", "file://"],
-        ),
-        (
-            ["http://localhost:3000", "http://localhost:9000"],
-            ["http://localhost:3000", "http://localhost:9000"],
-            ["http://example.org", "https://example.org", "file://"],
-        ),
-    ],
-)
-def test_graphql_view_access_control_allowed_origins(
-    client, settings, allowed_origins, allowed, not_allowed
-):
-    settings.ALLOWED_GRAPHQL_ORIGINS = allowed_origins
-    for origin in allowed:
-        response = client.options(API_PATH, HTTP_ORIGIN=origin)
-        assert response[ACCESS_CONTROL_ALLOW_ORIGIN] == origin
-    for origin in not_allowed:
-        response = client.options(API_PATH, HTTP_ORIGIN=origin)
-        assert ACCESS_CONTROL_ALLOW_ORIGIN not in response
 
 
 def test_invalid_request_body_non_debug(client):
@@ -224,13 +143,13 @@ def test_query_is_dict(client):
 
 def test_graphql_execution_exception(monkeypatch, api_client):
     def mocked_execute(*args, **kwargs):
-        raise IOError("Spanish inquisition")
+        raise OSError("Spanish inquisition")
 
-    monkeypatch.setattr("graphql.backend.core.execute_and_validate", mocked_execute)
+    monkeypatch.setattr("saleor.graphql.api.execute", mocked_execute)
     response = api_client.post_graphql("{ shop { name }}")
     assert response.status_code == 400
     content = get_graphql_content_from_response(response)
-    assert content["errors"][0]["message"] == "Spanish inquisition"
+    assert content["errors"][0]["message"] == INTERNAL_ERROR_MESSAGE
 
 
 def test_invalid_query_graphql_errors_are_logged_in_another_logger(
@@ -327,12 +246,6 @@ def test_unexpected_exceptions_are_logged_in_their_own_logger(
     ]
 
 
-def test_example_query(api_client, product):
-    response = api_client.post_graphql(EXAMPLE_QUERY)
-    content = get_graphql_content(response)
-    assert content["data"]["products"]["edges"][0]["node"]["name"] == product.name
-
-
 @pytest.mark.parametrize(
     "other_query",
     ["me{email}", 'products(first:5,channel:"channel"){edges{node{name}}}'],
@@ -372,7 +285,7 @@ INTROSPECTION_RESULT = {"__schema": {"queryType": {"name": "Query"}}}
 
 @mock.patch("saleor.graphql.views.cache.set")
 @mock.patch("saleor.graphql.views.cache.get")
-@override_settings(DEBUG=False)
+@override_settings(DEBUG=False, OBSERVABILITY_REPORT_ALL_API_CALLS=False)
 def test_introspection_query_is_cached(cache_get_mock, cache_set_mock, api_client):
     cache_get_mock.return_value = None
     cache_key = generate_cache_key(INTROSPECTION_QUERY)
@@ -387,7 +300,7 @@ def test_introspection_query_is_cached(cache_get_mock, cache_set_mock, api_clien
 
 @mock.patch("saleor.graphql.views.cache.set")
 @mock.patch("saleor.graphql.views.cache.get")
-@override_settings(DEBUG=False)
+@override_settings(DEBUG=False, OBSERVABILITY_REPORT_ALL_API_CALLS=False)
 def test_introspection_query_is_cached_only_once(
     cache_get_mock, cache_set_mock, api_client
 ):
@@ -402,7 +315,7 @@ def test_introspection_query_is_cached_only_once(
 
 @mock.patch("saleor.graphql.views.cache.set")
 @mock.patch("saleor.graphql.views.cache.get")
-@override_settings(DEBUG=True)
+@override_settings(DEBUG=True, OBSERVABILITY_REPORT_ALL_API_CALLS=False)
 def test_introspection_query_is_not_cached_in_debug_mode(
     cache_get_mock, cache_set_mock, api_client
 ):
@@ -416,3 +329,60 @@ def test_introspection_query_is_not_cached_in_debug_mode(
 def test_generate_cache_key_use_saleor_version():
     cache_key = generate_cache_key(INTROSPECTION_QUERY)
     assert saleor_version in cache_key
+
+
+def test_graphql_view_clears_context(rf, staff_user, product, channel_USD):
+    # given
+    product_id = graphene.Node.to_global_id("Product", product.pk)
+    channel_slug = channel_USD.slug
+    data = {
+        "query": f'{{ product(id: "{product_id}" channel: "{channel_slug}") {{ name category {{ name }} }} }}'
+    }
+    request = rf.post(path="/", data=data, content_type="application/json")
+    request.app = None
+    request.user = staff_user
+
+    # when
+    view = GraphQLView.as_view(backend=backend, schema=schema)
+    response = view(request)
+
+    # then
+    json_data = json.loads(response.content)
+    assert json_data["data"]["product"]["name"] == product.name
+    assert json_data["data"]["product"]["category"]["name"] == product.category.name
+    assert response.status_code == 200
+    assert request.dataloaders == {}
+
+
+@pytest.mark.parametrize(
+    ("public_url", "expected_url_base"),
+    [
+        (None, "http://testserver"),
+        ("http://some_custom_domain.com", "http://some_custom_domain.com"),
+    ],
+)
+@patch("saleor.graphql.views.render", wraps=render)
+def test_playground_is_rendered_with_proper_api_url_if_public_url_is_set(
+    mocked_render, rf, settings, public_url, expected_url_base
+):
+    # given
+    request = rf.get(
+        path="/",
+    )
+    request.app = None
+    request.user = None
+    settings.PUBLIC_URL = public_url
+
+    # when
+    view = GraphQLView.as_view(backend=backend, schema=schema)
+    view(request)
+
+    # then
+    mocked_render.assert_called_once_with(
+        request,
+        "graphql/playground.html",
+        {
+            "api_url": f"{expected_url_base}/graphql/",
+            "plugins_url": f"{expected_url_base}/plugins/",
+        },
+    )

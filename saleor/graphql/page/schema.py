@@ -1,22 +1,24 @@
 import graphene
 
+from ..core import ResolveInfo
 from ..core.connection import create_connection_slice, filter_connection_queryset
-from ..core.fields import FilterConnectionField
+from ..core.descriptions import ADDED_IN_321
+from ..core.doc_category import DOC_CATEGORY_PAGES
+from ..core.enums import LanguageCodeEnum
+from ..core.fields import BaseField, FilterConnectionField
 from ..core.utils import from_global_id_or_error
 from ..translations.mutations import PageTranslate
 from .bulk_mutations import PageBulkDelete, PageBulkPublish, PageTypeBulkDelete
 from .filters import PageFilterInput, PageTypeFilterInput
-from .mutations.attributes import (
+from .mutations import (
     PageAttributeAssign,
     PageAttributeUnassign,
-    PageReorderAttributeValues,
-    PageTypeReorderAttributes,
-)
-from .mutations.pages import (
     PageCreate,
     PageDelete,
+    PageReorderAttributeValues,
     PageTypeCreate,
     PageTypeDelete,
+    PageTypeReorderAttributes,
     PageTypeUpdate,
     PageUpdate,
 )
@@ -31,47 +33,66 @@ from .types import Page, PageCountableConnection, PageType, PageTypeCountableCon
 
 
 class PageQueries(graphene.ObjectType):
-    page = graphene.Field(
+    page = BaseField(
         Page,
         id=graphene.Argument(graphene.ID, description="ID of the page."),
         slug=graphene.String(description="The slug of the page."),
+        slug_language_code=graphene.Argument(
+            LanguageCodeEnum,
+            description="Language code of the page slug, omit to use primary slug."
+            + ADDED_IN_321,
+        ),
         description="Look up a page by ID or slug.",
+        doc_category=DOC_CATEGORY_PAGES,
     )
     pages = FilterConnectionField(
         PageCountableConnection,
         sort_by=PageSortingInput(description="Sort pages."),
         filter=PageFilterInput(description="Filtering options for pages."),
         description="List of the shop's pages.",
+        doc_category=DOC_CATEGORY_PAGES,
     )
-    page_type = graphene.Field(
+    page_type = BaseField(
         PageType,
         id=graphene.Argument(
             graphene.ID, description="ID of the page type.", required=True
         ),
         description="Look up a page type by ID.",
+        doc_category=DOC_CATEGORY_PAGES,
     )
     page_types = FilterConnectionField(
         PageTypeCountableConnection,
         sort_by=PageTypeSortingInput(description="Sort page types."),
         filter=PageTypeFilterInput(description="Filtering options for page types."),
         description="List of the page types.",
+        doc_category=DOC_CATEGORY_PAGES,
     )
 
-    def resolve_page(self, info, id=None, slug=None):
-        return resolve_page(info, id, slug)
+    @staticmethod
+    def resolve_page(
+        _root, info: ResolveInfo, *, id=None, slug=None, slug_language_code=None
+    ):
+        return resolve_page(info, id, slug, slug_language_code)
 
-    def resolve_pages(self, info, **kwargs):
-        qs = resolve_pages(info, **kwargs)
-        qs = filter_connection_queryset(qs, kwargs)
+    @staticmethod
+    def resolve_pages(_root, info: ResolveInfo, **kwargs):
+        qs = resolve_pages(info)
+        qs = filter_connection_queryset(
+            qs, kwargs, allow_replica=info.context.allow_replica
+        )
         return create_connection_slice(qs, info, kwargs, PageCountableConnection)
 
-    def resolve_page_type(self, info, id):
+    @staticmethod
+    def resolve_page_type(_root, info: ResolveInfo, *, id):
         _, id = from_global_id_or_error(id, PageType)
-        return resolve_page_type(id)
+        return resolve_page_type(info, id)
 
-    def resolve_page_types(self, info, **kwargs):
-        qs = resolve_page_types(info, **kwargs)
-        qs = filter_connection_queryset(qs, kwargs)
+    @staticmethod
+    def resolve_page_types(_root, info: ResolveInfo, **kwargs):
+        qs = resolve_page_types(info)
+        qs = filter_connection_queryset(
+            qs, kwargs, allow_replica=info.context.allow_replica
+        )
         return create_connection_slice(qs, info, kwargs, PageTypeCountableConnection)
 
 

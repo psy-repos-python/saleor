@@ -5,7 +5,6 @@ from django.db import migrations, models
 
 
 class Migration(migrations.Migration):
-
     dependencies = [
         ("giftcard", "0009_giftcard_fulfillment_line"),
     ]
@@ -46,6 +45,7 @@ class Migration(migrations.Migration):
                 related_name="gift_cards", to="giftcard.GiftCardTag"
             ),
         ),
+        # nosemgrep: add-index-concurrently
         migrations.AddIndex(
             model_name="giftcardtag",
             index=django.contrib.postgres.indexes.GinIndex(
